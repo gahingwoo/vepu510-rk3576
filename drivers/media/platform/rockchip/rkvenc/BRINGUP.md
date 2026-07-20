@@ -121,31 +121,56 @@ output, not guessed:
 
 ## Known gaps / best-effort areas (in rough priority order for board bring-up)
 
-0. **Isolated `rk_iommu` write fault, IN PROGRESS.** On an otherwise
-   successful encode (`bytesused` correct, no `V4L2_BUF_FLAG_ERROR`), a
-   single `rk_iommu: Page fault at 0x...of type write` sometimes appears,
-   followed ~200ms later by `rk_iommu_suspend()` (triggered by this
+0. **Isolated `rk_iommu` write fault, UNRESOLVED but not a functional
+   blocker.** On an otherwise fully successful encode (`bytesused`
+   correct, no `V4L2_BUF_FLAG_ERROR`, correct SPS/PPS/IDR bytes), a single
+   `rk_iommu: Page fault at 0x...of type write` sometimes appears,
+   followed ~150ms later by `rk_iommu_suspend()` (triggered by this
    driver's own `pm_runtime_put_autosuspend()`, since `vepu0`/`vepu0_mmu`
    share a power domain) hitting `Disable paging/stall request timed out`.
    The fault IOVA changes between boots but has a consistent byte
-   structure (fixed middle bytes, varying top byte) — ruled out as
-   "inherent hardware prefetch behavior" since a real vendor `mpi_enc_test`
-   capture on the same hardware never shows this fault at all, so there's
-   a real, currently-unidentified difference between what this driver
-   configures and what a working reference encode does. Tried so far,
-   none conclusive yet: resetting the core before every frame (made
-   things *worse* — a hardware `enc_err` status and a wildly-oversized
-   bitstream; reverted), a one-time reset in `probe()` via a real
-   `pm_runtime` activation (fixed a real problem — the core was never
-   explicitly reset to a defined state on a fresh boot at all — but
-   didn't stop this specific fault), and matching the CCU dual-core
-   handshake register (`RKVENC_REG_DUAL_CORE`, 0x304) to the vendor's own
-   real captured value instead of a disabled/zero one (register was
-   previously never written by this driver at all; not yet confirmed
-   whether this stops the fault). A temporary `dev_info()` dump of every
-   DMA address this driver's `rkvenc_h264_run()` uses is currently still
-   in the code (`rkvenc-h264.c`, right after the `RKVENC_REG_DBG_CLR`
-   write) to help correlate future fault IOVAs — remove once resolved.
+   structure (fixed middle bytes, varying top byte).
+
+   The downstream vendor driver's `rkvenc2_iommu_fault_handle()`
+   (`drivers/video/rockchip/mpp/mpp_rkvenc2.c`) confirms this exact class
+   of fault is a *known, tolerated* condition on real VEPU510 silicon —
+   its own comment: *"Mask iommu irq, in order for iommu not repeatedly
+   trigger pagefault. Until the pagefault task finish by hw timeout."* It
+   doesn't try to prevent the fault via register content; it masks the
+   IOMMU's IRQ (a vendor-kernel-only `rockchip_iommu_mask_irq()`
+   extension, absent from mainline `drivers/iommu/rockchip-iommu.c`) and
+   lets the task finish anyway.
+
+   Tried and reverted: resetting the core before every frame (made things
+   *worse* — a hardware `enc_err` status and a wildly-oversized
+   bitstream). Also tried and reverted: registering a generic mainline
+   `iommu_set_fault_handler()` — this made things worse too. This
+   device's IOMMU domain is the ordinary DMA-API domain (already claimed
+   by `iommu-dma` for this driver's own `dma_alloc_coherent`/vb2-dma-contig
+   buffers), and that API refuses (`WARN_ON`) to install a handler on a
+   domain whose cookie is already in use for something else — the
+   registration silently no-op'd while printing a scary `WARN_ON`
+   backtrace + tainting the kernel on every single boot, for zero actual
+   benefit. Reverted in full.
+
+   Kept (independently justified, not reverted): a one-time reset in
+   `probe()` via a real `pm_runtime` activation (the core was never
+   explicitly reset to a defined state on a fresh boot at all before —
+   fixed regardless of whether it affects this fault), and matching the
+   CCU dual-core handshake register (`RKVENC_REG_DUAL_CORE`, 0x304) to
+   the vendor's own real captured value instead of leaving it unwritten
+   (also a real, independently-confirmed gap). A temporary `dev_info()`
+   dump of every DMA address `rkvenc_h264_run()` uses is still in the
+   code (`rkvenc-h264.c`, right after `RKVENC_REG_DBG_CLR`) for future
+   correlation — remove once resolved.
+
+   A real fix likely needs to live in `drivers/iommu/rockchip-iommu.c`
+   itself (e.g. an upstream IRQ-mask primitive equivalent to the vendor's,
+   or making `rk_iommu_disable()`'s disable-paging/stall polling more
+   tolerant of a very recent fault), not this driver alone. Since the
+   encode itself has been correct on every single test run regardless of
+   this fault, it's a known cosmetic issue (alarming dmesg output), not a
+   confirmed functional blocker.
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).

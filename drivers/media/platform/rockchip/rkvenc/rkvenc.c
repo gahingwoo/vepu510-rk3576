@@ -52,6 +52,8 @@
 #define RKVENC_MAX_WIDTH		4096
 #define RKVENC_MAX_HEIGHT		2560
 
+#define RKVENC_AUTOSUSPEND_DELAY_MS		100
+
 /* Per-resolution hardware watchdog threshold table, ported from the
  * downstream vendor driver's rkvenc2_calc_timeout_thd() /
  * rkvenc2_timeout_thd_by_rsl[]. VEPU510 scales the ENC_WDG register in
@@ -766,7 +768,7 @@ static int rkvenc_probe(struct platform_device *pdev)
 	strscpy(rkvenc->vfd.name, "rkvenc", sizeof(rkvenc->vfd.name));
 	video_set_drvdata(&rkvenc->vfd, rkvenc);
 
-	pm_runtime_set_autosuspend_delay(dev, 100);
+	pm_runtime_set_autosuspend_delay(dev, RKVENC_AUTOSUSPEND_DELAY_MS);
 	pm_runtime_use_autosuspend(dev);
 	devm_pm_runtime_enable(dev);
 
