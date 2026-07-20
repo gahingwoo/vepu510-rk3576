@@ -209,6 +209,24 @@ union rkvenc_reg_enc_pic {
 
 #define RKVENC_ENC_STND_H264		0
 
+/* dual_core (0x304) is the CCU cross-core dual-encoder handshake register
+ * (DCHS_REG_OFFSET in the downstream vendor kernel's mpp_rkvenc2.c) --
+ * used for chaining a frame's encode across both VEPU510 cores. This
+ * driver deliberately doesn't implement that (see the architecture
+ * comment in rkvenc.c), but the register still needs to be explicitly
+ * disabled (dchs_txe=dchs_rxe=0) every frame: the vendor kernel's own
+ * rkvenc2_patch_dchs() writes a real, non-zero value here on EVERY task
+ * (even fully standalone, non-chained ones -- confirmed via a real wtrace
+ * capture: 0x304=0x14, i.e. dchs_txe=1, on a plain single-core encode),
+ * so POR-reset/leftover 0 is not necessarily what the hardware is
+ * actually in when this driver's probe() first runs. Previously left
+ * entirely unwritten by this driver (the register was *defined* in this
+ * header but never actually used) -- a real gap, found while chasing an
+ * isolated rk_iommu write fault at an IOVA far outside any of this
+ * driver's own real buffer addresses (see BRINGUP.md), consistent with an
+ * unconfigured cross-core handshake mechanism reading/writing through a
+ * garbage address instead of quietly doing nothing.
+ */
 union rkvenc_reg_dual_core {
 	struct {
 		u32 dchs_txid:2;

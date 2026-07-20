@@ -488,6 +488,19 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 
 	rkvenc_write_relaxed(dev, RKVENC_REG_DBG_CLR, RKVENC_DBG_CLR_VAL);
 
+	/* TEMPORARY diagnostic for the isolated rk_iommu write-fault seen on
+	 * first board bring-up (see BRINGUP.md "known gaps") -- dump every
+	 * real DMA address this frame uses so the fault IOVA can be
+	 * correlated against one of them (or ruled out as none of them,
+	 * pointing elsewhere). Remove once root-caused.
+	 */
+	dev_info(dev->dev,
+		 "run: src=%pad(+%u) dst=%pad(+%u,sz=%u) recn[w=%u]=%pad(+hdr%zu,+pix%zu) recn[r=%u]=%pad meiw=%pad\n",
+		 &src_dma, uv_offset, &dst_dma, header_len, dst_size,
+		 write_idx, &h264->recn_buf_dma[write_idx], h264->pixel_hdr_size,
+		 h264->pixel_buf_size, read_idx, &h264->recn_buf_dma[read_idx],
+		 &h264->meiw_buf_dma);
+
 	/* Source frame (NV12): adr_src0 = Y, adr_src1 = UV. adr_src2 (a 3rd
 	 * plane pointer NV12 doesn't have) must equal adr_src1, not 0 — mpp's
 	 * hal_h264e_vepu510.c sets it unconditionally to the same fd as
@@ -799,6 +812,20 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 
 		rkvenc_vepu510_quirk(dev);
 		rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
+
+		/* CCU dual-core handshake register -- see the union
+		 * rkvenc_reg_dual_core comment in rkvenc-regs.h for why this
+		 * can't just be left unwritten. Writing plain 0 (fully
+		 * disabled: dchs_txe=dchs_rxe=0) did NOT stop an isolated
+		 * rk_iommu write fault seen on board bring-up, despite being
+		 * the more conservative-looking choice -- use the vendor
+		 * kernel's own real captured value instead (0x14, i.e.
+		 * dchs_txe=1) since that's what a real, working, fault-free
+		 * encode on this exact hardware actually uses, even for a
+		 * fully standalone non-chained task. "Disabled" apparently
+		 * isn't the same as "inert" for this register.
+		 */
+		rkvenc_write_relaxed(dev, RKVENC_REG_DUAL_CORE, 0x14);
 
 		wmb(); /* all task registers visible before the kick below */
 

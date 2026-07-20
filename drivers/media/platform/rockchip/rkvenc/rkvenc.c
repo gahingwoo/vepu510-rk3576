@@ -770,6 +770,34 @@ static int rkvenc_probe(struct platform_device *pdev)
 	pm_runtime_use_autosuspend(dev);
 	devm_pm_runtime_enable(dev);
 
+	/*
+	 * One-time reset cycle (via a real pm_runtime activation, so the
+	 * power domain and clocks are genuinely on rather than assuming raw
+	 * clk_bulk_prepare_enable() alone would power an unattached genpd)
+	 * so the core starts from a defined state rather than whatever the
+	 * bootloader/ATF left it in -- otherwise reset is only ever touched
+	 * by rkvenc_watchdog()'s error-recovery path, never on a normal
+	 * first activation. Board bring-up saw an isolated rk_iommu write
+	 * fault at an IOVA that changed between boots and matched none of
+	 * this driver's own buffer addresses, consistent with undefined
+	 * boot-varying hardware state.
+	 *
+	 * Done once here, not on every rkvenc_runtime_resume(): that was
+	 * tried first and made things worse (a hardware-reported "enc_err"
+	 * status on the very next encode, with a bitstream length wildly
+	 * larger than the same test frame ever produced before) -- something
+	 * about this core's state is expected to persist for the life of the
+	 * session, not be re-initialized before every single frame.
+	 */
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to power up for initial reset\n");
+	reset_control_assert(rkvenc->rst);
+	udelay(5);
+	reset_control_deassert(rkvenc->rst);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+
 	ret = video_register_device(&rkvenc->vfd, VFL_TYPE_VIDEO, -1);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to register video device\n");

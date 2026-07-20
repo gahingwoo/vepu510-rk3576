@@ -1,8 +1,9 @@
 # RK3576 VEPU510 encoder driver — status
 
 v1 upstream-style V4L2 stateful mem2mem driver for the VEPU510 H.264
-hardware encoder (RK3576, e.g. Radxa ROCK 4D). Not yet run on hardware —
-this is a from-scratch clean-room driver built by cross-reading two
+hardware encoder (RK3576, e.g. Radxa ROCK 4D). **Confirmed producing a
+real, correctly-structured H.264 bitstream on real hardware** — see bug 4
+below. This is a from-scratch clean-room driver built by cross-reading two
 sources, no vendor kernel code copied:
 
 - `drivers/video/rockchip/mpp/mpp_rkvenc2.c` (rockchip-linux/kernel,
@@ -120,6 +121,31 @@ output, not guessed:
 
 ## Known gaps / best-effort areas (in rough priority order for board bring-up)
 
+0. **Isolated `rk_iommu` write fault, IN PROGRESS.** On an otherwise
+   successful encode (`bytesused` correct, no `V4L2_BUF_FLAG_ERROR`), a
+   single `rk_iommu: Page fault at 0x...of type write` sometimes appears,
+   followed ~200ms later by `rk_iommu_suspend()` (triggered by this
+   driver's own `pm_runtime_put_autosuspend()`, since `vepu0`/`vepu0_mmu`
+   share a power domain) hitting `Disable paging/stall request timed out`.
+   The fault IOVA changes between boots but has a consistent byte
+   structure (fixed middle bytes, varying top byte) — ruled out as
+   "inherent hardware prefetch behavior" since a real vendor `mpi_enc_test`
+   capture on the same hardware never shows this fault at all, so there's
+   a real, currently-unidentified difference between what this driver
+   configures and what a working reference encode does. Tried so far,
+   none conclusive yet: resetting the core before every frame (made
+   things *worse* — a hardware `enc_err` status and a wildly-oversized
+   bitstream; reverted), a one-time reset in `probe()` via a real
+   `pm_runtime` activation (fixed a real problem — the core was never
+   explicitly reset to a defined state on a fresh boot at all — but
+   didn't stop this specific fault), and matching the CCU dual-core
+   handshake register (`RKVENC_REG_DUAL_CORE`, 0x304) to the vendor's own
+   real captured value instead of a disabled/zero one (register was
+   previously never written by this driver at all; not yet confirmed
+   whether this stops the fault). A temporary `dev_info()` dump of every
+   DMA address this driver's `rkvenc_h264_run()` uses is currently still
+   in the code (`rkvenc-h264.c`, right after the `RKVENC_REG_DBG_CLR`
+   write) to help correlate future fault IOVAs — remove once resolved.
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).
