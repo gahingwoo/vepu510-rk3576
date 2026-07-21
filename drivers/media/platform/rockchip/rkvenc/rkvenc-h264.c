@@ -488,20 +488,45 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 
 	rkvenc_write_relaxed(dev, RKVENC_REG_DBG_CLR, RKVENC_DBG_CLR_VAL);
 
-	/* EXPERIMENT, RESULT NEGATIVE (see git log): a "force-clear" of
-	 * RKVENC_REG_ENC_CLR (write 0x2, delay, write 0) right here, ported
-	 * from a real working VEPU580 driver
-	 * (rcawston/rockchip-rk3588-mainline-patches) where it's gated behind
-	 * `hw->vepu_type == RKVENC_VEPU_580`, was tried unconditionally on
-	 * VEPU510 as a hypothesis for the isolated rk_iommu fault below. It
-	 * did not stop that fault, and applying it unconditionally (without
-	 * the vendor's own VEPU510 confirmation) caused a real regression
-	 * under multi-frame testing: every frame failed with a genuine
-	 * hardware watchdog (int_sta wdg), not just the cosmetic IOMMU fault.
-	 * Reverted. The vendor's own gate on this workaround was apparently
-	 * there for a reason -- don't re-add without evidence VEPU510
-	 * actually needs it.
+	/* Clear the ENTIRE FRAME class (0x270-0x3f4) before programming the
+	 * specific registers below. This is the fix for the isolated rk_iommu
+	 * WRITE fault seen since first bring-up (a wild write to a boot-varying
+	 * garbage IOVA with a stable 0x??b239?? signature -- the hallmark of a
+	 * stale/uninitialized pointer register).
+	 *
+	 * Root cause, found by diffing a real multi-frame vendor wtrace capture:
+	 * the downstream vendor kernel writes its ENTIRE register file linearly
+	 * every frame, so every register -- including ~50 FRAME-class registers
+	 * this from-scratch driver never touches -- is always defined. Among the
+	 * ones this driver skipped are real hardware WRITE-pointer registers:
+	 * lpfw_addr(0x2c0, loop-filter write), lpfr_addr(0x2c4), ebuft/ebufb_addr
+	 * (0x2c8/0x2cc), adr_roir(0x2e8), and 0x29c/0x2a0. The vendor writes all
+	 * of them as 0; this driver left them at whatever the bootloader/ATF/a
+	 * previous session left behind. A garbage value in a write-pointer the
+	 * hardware still consults (the H.264 deblocking loop filter writes its
+	 * filtered output every frame) makes the engine DMA to that garbage
+	 * address -> the IOMMU write fault. Because the faulting write is a
+	 * reference/recon-path write (not the bitstream), the I-frame's bitstream
+	 * still completes, but the reconstruction it leaves for the next P-frame
+	 * is corrupt -- which is the most likely reason every P-frame then hangs
+	 * reading a bad reference (and why a larger resolution, whose stale
+	 * pointer lands somewhere more essential, fails even the I-frame).
+	 *
+	 * Zeroing the FRAME-class address/pointer block first (then overwriting
+	 * the specific registers below) reproduces the vendor's "every register
+	 * defined every frame" invariant with a single cheap loop, rather than
+	 * enumerating every skipped register by hand. The block 0x270-0x2ec is
+	 * exactly where every DMA write pointer lives; the syntax registers at
+	 * 0x300+ that this driver skips (e.g. 0x3c8-0x3f4) are non-pointer and
+	 * so carry no wild-write risk, but they are all written explicitly with
+	 * real values or left correct-at-zero elsewhere anyway.
 	 */
+	{
+		u32 off;
+
+		for (off = RKVENC_REG_FRAME_OFFSET; off <= RKVENC_REG_ADR_ROIR; off += 4)
+			rkvenc_write_relaxed(dev, off, 0);
+	}
 
 	/* TEMPORARY diagnostic for the isolated rk_iommu write-fault seen on
 	 * first board bring-up (see BRINGUP.md "known gaps") -- dump every

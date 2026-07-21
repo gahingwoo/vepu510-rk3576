@@ -528,6 +528,13 @@ union rkvenc_reg_synt_sli2 {
 #define RKVENC_RFPT_DISABLED		0xffffffff
 #define RKVENC_REG_ADR_SMEAR_RD		0x2e0
 #define RKVENC_REG_ADR_SMEAR_WR		0x2e4
+/* Last DMA pointer in the FRAME class (ROI read address). The whole
+ * 0x270-0x2e8 block is zeroed at the top of rkvenc_h264_run() to clear any
+ * stale/garbage write pointers (lpfw/lpfr/ebuft/ebufb at 0x2c0-0x2cc, this,
+ * and 0x29c/0x2a0) that the vendor always writes but this driver otherwise
+ * skips -- see the big comment there.
+ */
+#define RKVENC_REG_ADR_ROIR		0x2e8
 #define RKVENC_REG_ENC_PIC		0x300
 #define RKVENC_REG_DUAL_CORE		0x304
 #define RKVENC_REG_ENC_ID		0x308
