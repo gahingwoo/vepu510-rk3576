@@ -528,6 +528,7 @@ static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 	struct rkvenc_dev *dev = priv;
 	struct rkvenc_ctx *ctx = dev->cur_ctx;
 	enum vb2_buffer_state state;
+	u32 off;
 
 	if (!ctx)
 		return IRQ_HANDLED;
@@ -538,7 +539,23 @@ static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 	state = (dev->irq_status & RKVENC_INT_ERROR_MASK) ?
 		VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
 
-	if (state == VB2_BUF_STATE_ERROR)
+	/* TEMPORARY diagnostic for the P-frame hardware-watchdog hang (see
+	 * BRINGUP.md) -- dump the same 0x5100-0x515c DEBUG-class range the
+	 * downstream vendor kernel's own genuine-timeout path reads back
+	 * (rkvenc2_task_timeout_process() in mpp_rkvenc2.c), on EVERY
+	 * completion (not just failures), so a working I-frame's baseline
+	 * values and a hung P-frame's values land in the same log for a
+	 * direct diff. No field names are known for this range (opaque even
+	 * in the vendor driver, which just offset+value-dumps it too).
+	 * Remove once root-caused.
+	 */
+	for (off = RKVENC_REG_DEBUG_TIMEOUT_DUMP_START;
+	     off < RKVENC_REG_DEBUG_TIMEOUT_DUMP_END; off += 4)
+		dev_info(dev->dev, "debug dump [%s] 0x%04x = 0x%08x\n",
+			 state == VB2_BUF_STATE_DONE ? "done" : "error",
+			 off, rkvenc_read(dev, off));
+
+	if (state == VB2_BUF_STATE_ERROR) {
 		dev_warn(dev->dev,
 			 "encode error, int_sta=0x%08x (error bits: %s%s%s%s%s%s%s%s) "
 			 "version=0x%08x enc_strt=0x%08x int_en=0x%08x int_msk=0x%08x "
@@ -570,6 +587,7 @@ static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 			 rkvenc_read(dev, RKVENC_REG_ST_BS_LENGTH),
 			 rkvenc_read(dev, RKVENC_REG_ST_SLICE_NUM),
 			 rkvenc_read(dev, RKVENC_REG_ST_BSB));
+	}
 
 	ctx->coded_desc->ops->done(ctx, state);
 	rkvenc_job_finish(dev, ctx, state);

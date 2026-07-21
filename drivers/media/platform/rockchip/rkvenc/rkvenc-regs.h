@@ -923,4 +923,16 @@ union rkvenc_reg_smear_opt_cfg {
 #define RKVENC_REG_DBG_CLR		0x5300
 #define RKVENC_DBG_CLR_VAL		0x2
 
+/* Downstream vendor kernel's own genuine-hardware-timeout diagnostic range
+ * (rkvenc2_task_timeout_process()'s RKVENC2_TIMEOUT_DUMP_REG_START/END in
+ * mpp_rkvenc2.c) -- dumped via a generic offset+value reg_show(), no field
+ * names anywhere (same "opaque DEBUG class" situation as the rest of this
+ * class). If the vendor's own driver considers this specific 0x5100-0x515c
+ * range worth reading back on a real timeout, it's the most likely place to
+ * see *something* distinguishing the internal engine state at the moment a
+ * P-frame hangs vs a working I-frame, even with no field semantics known.
+ */
+#define RKVENC_REG_DEBUG_TIMEOUT_DUMP_START	0x5100
+#define RKVENC_REG_DEBUG_TIMEOUT_DUMP_END	0x5160	/* exclusive */
+
 #endif /* RKVENC_REGS_H_ */
