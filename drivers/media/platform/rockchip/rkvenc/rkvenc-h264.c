@@ -488,6 +488,21 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 
 	rkvenc_write_relaxed(dev, RKVENC_REG_DBG_CLR, RKVENC_DBG_CLR_VAL);
 
+	/* EXPERIMENT, RESULT NEGATIVE (see git log): a "force-clear" of
+	 * RKVENC_REG_ENC_CLR (write 0x2, delay, write 0) right here, ported
+	 * from a real working VEPU580 driver
+	 * (rcawston/rockchip-rk3588-mainline-patches) where it's gated behind
+	 * `hw->vepu_type == RKVENC_VEPU_580`, was tried unconditionally on
+	 * VEPU510 as a hypothesis for the isolated rk_iommu fault below. It
+	 * did not stop that fault, and applying it unconditionally (without
+	 * the vendor's own VEPU510 confirmation) caused a real regression
+	 * under multi-frame testing: every frame failed with a genuine
+	 * hardware watchdog (int_sta wdg), not just the cosmetic IOMMU fault.
+	 * Reverted. The vendor's own gate on this workaround was apparently
+	 * there for a reason -- don't re-add without evidence VEPU510
+	 * actually needs it.
+	 */
+
 	/* TEMPORARY diagnostic for the isolated rk_iommu write-fault seen on
 	 * first board bring-up (see BRINGUP.md "known gaps") -- dump every
 	 * real DMA address this frame uses so the fault IOVA can be
@@ -620,6 +635,18 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 
 		rc_qp.rc_max_qp = qp;
 		rc_qp.rc_min_qp = qp;
+		/* EXPERIMENT, RESULT NEGATIVE (see git log): tried rc_qp_range=1
+		 * (matching a real successful mpp capture's adaptive-RC value)
+		 * instead of 0, as a hypothesis for the isolated rk_iommu fault
+		 * below -- didn't stop it, and combined with other experimental
+		 * changes at the time, board testing showed a real regression
+		 * (every frame failing with a genuine hardware watchdog under
+		 * multi-frame testing). Reverted to 0, which is confirmed safe
+		 * for the fixed-QP output this driver actually wants (with
+		 * rc_min_qp==rc_max_qp, AQ has no room to move QP regardless of
+		 * range, so 0 vs 1 shouldn't matter for correctness -- but 0 is
+		 * the value that's actually been confirmed not to regress).
+		 */
 		rc_qp.rc_qp_range = 0;
 		rkvenc_write_relaxed(dev, RKVENC_REG_RC_QP, rc_qp.val);
 		rkvenc_write_relaxed(dev, RKVENC_REG_RC_TGT, (u32)mb_target_bits_mul_16);
@@ -826,6 +853,20 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		 * isn't the same as "inert" for this register.
 		 */
 		rkvenc_write_relaxed(dev, RKVENC_REG_DUAL_CORE, 0x14);
+
+		/* EXPERIMENT, RESULT NEGATIVE (see git log): an explicit full
+		 * IOTLB flush right here (iommu_flush_iotlb_all() on the
+		 * device's domain), matching a real working reference driver
+		 * for the sibling VEPU580 IP
+		 * (rcawston/rockchip-rk3588-mainline-patches), was tried as a
+		 * hypothesis for the isolated rk_iommu fault below. Didn't
+		 * stop it, and combined with other experimental changes at the
+		 * time, board testing showed a real regression (every frame
+		 * failing with a genuine hardware watchdog under multi-frame
+		 * testing) -- not confirmed this specific change caused it
+		 * (three things changed at once), but reverted along with the
+		 * others pending isolated re-testing.
+		 */
 
 		wmb(); /* all task registers visible before the kick below */
 

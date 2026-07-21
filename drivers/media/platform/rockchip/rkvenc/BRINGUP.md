@@ -153,6 +153,25 @@ output, not guessed:
    backtrace + tainting the kernel on every single boot, for zero actual
    benefit. Reverted in full.
 
+   Also tried and reverted, from a real working reference driver for the
+   sibling VEPU580 IP (rcawston/rockchip-rk3588-mainline-patches): an
+   "ENC_CLR force-clear" before the main register writes (their own
+   comment: *"Add force clear to avoid pagefault (VEPU580 workaround)"*,
+   gated behind `hw->vepu_type == RKVENC_VEPU_580` in their source — this
+   driver tried it unconditionally on VEPU510, which turned out to be
+   unsafe: under multi-frame testing it caused every frame to fail with a
+   genuine hardware watchdog, not just the cosmetic IOMMU fault); an
+   explicit `iommu_flush_iotlb_all()` right before the kick (same
+   reference driver, unconditional there too); and `rc_qp.rc_qp_range=1`
+   instead of `0` (matching a real successful mpp capture's adaptive-RC
+   value, on the theory that `range=0` might be a degenerate case for the
+   hardware's internal AQ search — even though `rc_min_qp==rc_max_qp`
+   should make the range moot for actual output). None of the three
+   stopped the IOMMU fault, and stacked together they caused the
+   multi-frame regression above — reverted as a set (not individually
+   bisected, since the whole investigation was shelved regardless of
+   which one was the actual culprit).
+
    Kept (independently justified, not reverted): a one-time reset in
    `probe()` via a real `pm_runtime` activation (the core was never
    explicitly reset to a defined state on a fresh boot at all before —
@@ -164,13 +183,17 @@ output, not guessed:
    code (`rkvenc-h264.c`, right after `RKVENC_REG_DBG_CLR`) for future
    correlation — remove once resolved.
 
-   A real fix likely needs to live in `drivers/iommu/rockchip-iommu.c`
+   **Shelved.** After 8 total attempts across register content, timing,
+   and IOMMU-API angles, none stopped the fault, and the encode itself
+   has been byte-correct on every single test run regardless of it. A
+   real fix likely needs to live in `drivers/iommu/rockchip-iommu.c`
    itself (e.g. an upstream IRQ-mask primitive equivalent to the vendor's,
    or making `rk_iommu_disable()`'s disable-paging/stall polling more
-   tolerant of a very recent fault), not this driver alone. Since the
-   encode itself has been correct on every single test run regardless of
-   this fault, it's a known cosmetic issue (alarming dmesg output), not a
-   confirmed functional blocker.
+   tolerant of a very recent fault), not this driver alone. Treated as a
+   known cosmetic issue (alarming dmesg output, no observed functional
+   impact) rather than a blocker — don't resume blind attempts here
+   without a genuinely new lead (new instrumentation data, not another
+   register guess).
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).

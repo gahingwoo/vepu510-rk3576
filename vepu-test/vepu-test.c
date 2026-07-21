@@ -5,17 +5,20 @@
  * so this talks to /dev/videoN directly via ioctl(), mirroring the same
  * "small standalone cross-compiled probe tool" style as replay/replay_rocket.c.
  *
- * Encodes exactly ONE synthetic NV12 frame (a horizontal luma gradient, flat
- * 128 chroma) and dumps the resulting bitstream, so this only exercises the
- * IDR/SPS-PPS path (gop_pos==0 on a fresh open) -- see the driver README's
- * bring-up checklist for why that's the right first test (P-frames touch the
- * FBC reference-buffer path, which is the least-verified part of the driver).
+ * Encodes N synthetic NV12 frames (default 10, a horizontal luma gradient
+ * that shifts a little each frame, flat 128 chroma) and dumps the resulting
+ * Annex-B bitstream as one playable file. With the default GOP size (30),
+ * frame 0 is the IDR/SPS-PPS path and frames 1..N-1 exercise the P-frame /
+ * FBC reference-buffer read path -- the least-verified part of the driver
+ * until this multi-frame mode existed (see the driver README's bring-up
+ * checklist).
  *
- * Usage: vepu-test [/dev/video0] [width] [height] [out.h264]
+ * Usage: vepu-test [/dev/video0] [width] [height] [out.h264] [num_frames]
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +41,7 @@ static int xioctl(int fd, unsigned long req, void *arg)
 }
 
 static void fill_nv12_gradient(unsigned char *buf, unsigned int width,
-			       unsigned int height)
+			       unsigned int height, unsigned int shift)
 {
 	unsigned int x, y;
 	unsigned char *y_plane = buf;
@@ -46,7 +49,8 @@ static void fill_nv12_gradient(unsigned char *buf, unsigned int width,
 
 	for (y = 0; y < height; y++)
 		for (x = 0; x < width; x++)
-			y_plane[y * width + x] = (unsigned char)(x * 255 / (width - 1));
+			y_plane[y * width + x] =
+				(unsigned char)(((x + shift) % width) * 255 / (width - 1));
 
 	memset(uv_plane, 128, (size_t)width * height / 2);
 }
@@ -57,6 +61,7 @@ int main(int argc, char **argv)
 	unsigned int width = argc > 2 ? (unsigned int)atoi(argv[2]) : 176;
 	unsigned int height = argc > 3 ? (unsigned int)atoi(argv[3]) : 144;
 	const char *outpath = argc > 4 ? argv[4] : "/opt/npu-test/vepu-out.h264";
+	unsigned int num_frames = argc > 5 ? (unsigned int)atoi(argv[5]) : 10;
 
 	struct v4l2_capability cap = {0};
 	struct v4l2_format fmt = {0};
@@ -66,6 +71,7 @@ int main(int argc, char **argv)
 	void *out_map, *cap_map;
 	size_t out_len, cap_len;
 	FILE *out;
+	unsigned int frame, errors = 0;
 
 	fd = open(dev, O_RDWR);
 	CHECK(fd >= 0, "open");
@@ -95,7 +101,7 @@ int main(int argc, char **argv)
 	       fmt.fmt.pix.sizeimage);
 	cap_len = fmt.fmt.pix.sizeimage;
 
-	/* OUTPUT queue: one buffer, fill it, queue it */
+	/* OUTPUT queue: one buffer, reused/re-queued every frame */
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	reqbuf.memory = V4L2_MEMORY_MMAP;
 	reqbuf.count = 1;
@@ -110,11 +116,7 @@ int main(int argc, char **argv)
 		      buf.m.offset);
 	CHECK(out_map != MAP_FAILED, "mmap(OUTPUT)");
 
-	fill_nv12_gradient(out_map, width, height);
-	buf.bytesused = out_len;
-	CHECK(xioctl(fd, VIDIOC_QBUF, &buf) == 0, "VIDIOC_QBUF(OUTPUT)");
-
-	/* CAPTURE queue: one buffer, queue it empty to receive the encode */
+	/* CAPTURE queue: one buffer, reused/re-queued every frame */
 	memset(&reqbuf, 0, sizeof(reqbuf));
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	reqbuf.memory = V4L2_MEMORY_MMAP;
@@ -129,36 +131,57 @@ int main(int argc, char **argv)
 	cap_map = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
 		      buf.m.offset);
 	CHECK(cap_map != MAP_FAILED, "mmap(CAPTURE)");
-	CHECK(xioctl(fd, VIDIOC_QBUF, &buf) == 0, "VIDIOC_QBUF(CAPTURE)");
+
+	out = fopen(outpath, "wb");
+	CHECK(out != NULL, "fopen(outpath)");
 
 	i = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	CHECK(xioctl(fd, VIDIOC_STREAMON, &i) == 0, "VIDIOC_STREAMON(OUTPUT)");
 	i = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	CHECK(xioctl(fd, VIDIOC_STREAMON, &i) == 0, "VIDIOC_STREAMON(CAPTURE)");
 
-	/* Blocks until the hardware (or the watchdog, on error) finishes the frame. */
-	memset(&buf, 0, sizeof(buf));
-	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	buf.memory = V4L2_MEMORY_MMAP;
-	CHECK(xioctl(fd, VIDIOC_DQBUF, &buf) == 0, "VIDIOC_DQBUF(CAPTURE)");
+	for (frame = 0; frame < num_frames; frame++) {
+		bool is_error, is_key;
 
-	printf("encoded frame: bytesused=%u flags=0x%x\n", buf.bytesused, buf.flags);
-	printf("first 16 bytes:");
-	for (unsigned int k = 0; k < 16 && k < buf.bytesused; k++)
-		printf(" %02x", ((unsigned char *)cap_map)[k]);
-	printf("\n(expect 00 00 00 01 27 = SPS, then 00 00 00 01 28 = PPS,"
-	       " then 00 00 00 01 25 = IDR slice)\n");
+		fill_nv12_gradient(out_map, width, height, frame * 8);
 
-	out = fopen(outpath, "wb");
-	CHECK(out != NULL, "fopen(outpath)");
-	fwrite(cap_map, 1, buf.bytesused, out);
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index = 0;
+		buf.bytesused = out_len;
+		CHECK(xioctl(fd, VIDIOC_QBUF, &buf) == 0, "VIDIOC_QBUF(OUTPUT)");
+
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index = 0;
+		CHECK(xioctl(fd, VIDIOC_QBUF, &buf) == 0, "VIDIOC_QBUF(CAPTURE)");
+
+		/* Blocks until the hardware (or the watchdog, on error) finishes. */
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		CHECK(xioctl(fd, VIDIOC_DQBUF, &buf) == 0, "VIDIOC_DQBUF(CAPTURE)");
+
+		is_error = !!(buf.flags & V4L2_BUF_FLAG_ERROR);
+		is_key = !!(buf.flags & V4L2_BUF_FLAG_KEYFRAME);
+		printf("frame %2u: bytesused=%u flags=0x%x%s%s\n", frame, buf.bytesused,
+		       buf.flags, is_key ? " KEY" : " P", is_error ? " *** ERROR ***" : "");
+		if (is_error || buf.bytesused == 0)
+			errors++;
+
+		fwrite(cap_map, 1, buf.bytesused, out);
+
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+		buf.memory = V4L2_MEMORY_MMAP;
+		CHECK(xioctl(fd, VIDIOC_DQBUF, &buf) == 0, "VIDIOC_DQBUF(OUTPUT)");
+	}
+
 	fclose(out);
-	printf("wrote %u bytes to %s\n", buf.bytesused, outpath);
-
-	memset(&buf, 0, sizeof(buf));
-	buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	buf.memory = V4L2_MEMORY_MMAP;
-	CHECK(xioctl(fd, VIDIOC_DQBUF, &buf) == 0, "VIDIOC_DQBUF(OUTPUT)");
+	printf("wrote %u frame(s) to %s (%u error%s)\n", num_frames, outpath,
+	       errors, errors == 1 ? "" : "s");
 
 	i = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 	xioctl(fd, VIDIOC_STREAMOFF, &i);
@@ -169,5 +192,5 @@ int main(int argc, char **argv)
 	munmap(cap_map, cap_len);
 	close(fd);
 
-	return 0;
+	return errors ? 1 : 0;
 }
