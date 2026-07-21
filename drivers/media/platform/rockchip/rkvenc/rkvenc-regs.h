@@ -398,7 +398,14 @@ union rkvenc_reg_sli_cnum {
 	u32 val;
 };
 
-/* H.264-specific trailer, 0x3a0-0x3f4 */
+/* H.264-specific trailer, 0x3a0-0x3f4.
+ * rdo_cfg.chrm_spcl/ccwa_e/atr_mult_sel_e: mpp's setup_vepu510_rdo_pred()
+ * (hal_h264e_vepu510.c) sets these three unconditionally to 1 on every
+ * single frame -- not gated by profile/level/tune config like rect_size/
+ * vlc_lmt/atf_e/atr_e are. Found missing by diffing against that function
+ * directly; previously left at their reset-value 0 here since nothing in
+ * this driver ever set them.
+ */
 union rkvenc_reg_rdo_cfg {
 	struct {
 		u32 rect_size:1;
@@ -692,6 +699,115 @@ union rkvenc_reg_roi_qthd3 {
 		u32 qpmax_area7:6;
 		u32 reserved:24;
 		u32 qpmap_mode:2;
+	};
+	u32 val;
+};
+
+/* RC_ROI tail (0x1044-0x107c): AQ activity threshold/step LUT, MAD-based
+ * statistics thresholds, and a chroma KLUT offset -- all real fields in
+ * mpp's Vepu510RcRoi struct (vepu510_common.h) that this driver used to
+ * leave entirely unwritten. Found by diffing this driver's register writes
+ * against mpp's actual setup_vepu510_aq()/setup_vepu510_me()/
+ * setup_vepu510_rdo_pred() (hal_h264e_vepu510.c), not just the single
+ * I-frame wtrace capture used to fix the original whole-class stall (see
+ * the RC_ROI banner comment above) -- that capture never exercised these
+ * particular offsets either, since a from-scratch driver only writes what
+ * it's told to, and nothing had told it to write these yet.
+ *
+ * mpp writes aq_tthd/aq_stp/madi_st_thd/madp_st_thd0/madp_st_thd1
+ * unconditionally on every frame regardless of slice type (setup_vepu510_me()
+ * has no I/P branch for these), and klut_ofst.chrm_klut_ofst is 6 for I
+ * slices and 6 or 9 for P slices depending on an IPC scene-tuning mode this
+ * driver doesn't expose (so 6 is correct for both here). These sit in
+ * exactly the register class board bring-up already proved needs
+ * non-degenerate content for the hardware to complete at all (see the RC_ROI
+ * banner comment) -- left at POR/leftover 0 instead of mpp's real nonzero
+ * table, this is a plausible source of a real internal stall that happens to
+ * only bite once real per-block activity/MAD statistics get computed and
+ * compared against these thresholds, i.e. during genuine inter-mode
+ * (P-frame) analysis rather than intra.
+ */
+#define RKVENC_REG_AQ_TTHD		0x1044	/* 4 words, 16 packed u8 thresholds */
+#define RKVENC_REG_AQ_STP0		0x1054
+#define RKVENC_REG_AQ_STP1		0x1058
+#define RKVENC_REG_AQ_STP2		0x105c
+#define RKVENC_REG_MADI_ST_THD		0x1064
+#define RKVENC_REG_MADP_ST_THD0	0x1068
+#define RKVENC_REG_MADP_ST_THD1	0x106c
+#define RKVENC_REG_KLUT_OFST		0x107c
+
+union rkvenc_reg_aq_stp0 {
+	struct {
+		s32 aq_stp_s0:5;
+		s32 aq_stp_0t1:5;
+		s32 aq_stp_1t2:5;
+		s32 aq_stp_2t3:5;
+		s32 aq_stp_3t4:5;
+		s32 aq_stp_4t5:5;
+		u32 reserved:2;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_aq_stp1 {
+	struct {
+		s32 aq_stp_5t6:5;
+		s32 aq_stp_6t7:5;
+		s32 aq_stp_7t8:5;
+		s32 aq_stp_8t9:5;
+		s32 aq_stp_9t10:5;
+		s32 aq_stp_10t11:5;
+		u32 reserved:2;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_aq_stp2 {
+	struct {
+		s32 aq_stp_11t12:5;
+		s32 aq_stp_12t13:5;
+		s32 aq_stp_13t14:5;
+		s32 aq_stp_14t15:5;
+		s32 aq_stp_b15:5;
+		u32 reserved:7;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_madi_st_thd {
+	struct {
+		u32 madi_th0:8;
+		u32 madi_th1:8;
+		u32 madi_th2:8;
+		u32 reserved:8;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_madp_st_thd0 {
+	struct {
+		u32 madp_th0:12;
+		u32 reserved:4;
+		u32 madp_th1:12;
+		u32 reserved1:4;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_madp_st_thd1 {
+	struct {
+		u32 madp_th2:12;
+		u32 reserved:20;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_klut_ofst {
+	struct {
+		u32 chrm_klut_ofst:4;
+		u32 reserved:4;
+		u32 inter_chrm_dist_multi:6;
+		u32 reserved1:18;
 	};
 	u32 val;
 };

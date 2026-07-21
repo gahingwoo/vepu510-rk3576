@@ -704,6 +704,75 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		rkvenc_write_relaxed(dev, RKVENC_REG_ROI_QTHD3, roi_qthd3.val);
 	}
 
+	/* AQ activity LUT / MAD-statistics thresholds / chroma KLUT offset:
+	 * see the banner comment above RKVENC_REG_AQ_TTHD in rkvenc-regs.h --
+	 * real fields this driver never wrote at all until now, found by
+	 * diffing against mpp's setup_vepu510_aq()/setup_vepu510_me()/
+	 * setup_vepu510_rdo_pred(), all written unconditionally every frame
+	 * (mpp's own default aq_tthd/aq_step tables are identical for I and P
+	 * slices; klut_ofst is 6 for both in the non-IPC-tuning default this
+	 * driver matches).
+	 */
+	{
+		static const u8 aq_tthd[16] = {
+			0, 0, 0, 0, 3, 3, 5, 5, 8, 8, 8, 15, 15, 20, 25, 25,
+		};
+		static const s32 aq_step[16] = {
+			-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 7, 8,
+		};
+		union rkvenc_reg_aq_stp0 aq_stp0 = { .val = 0 };
+		union rkvenc_reg_aq_stp1 aq_stp1 = { .val = 0 };
+		union rkvenc_reg_aq_stp2 aq_stp2 = { .val = 0 };
+		union rkvenc_reg_madi_st_thd madi_st_thd = { .val = 0 };
+		union rkvenc_reg_madp_st_thd0 madp_st_thd0 = { .val = 0 };
+		union rkvenc_reg_madp_st_thd1 madp_st_thd1 = { .val = 0 };
+		union rkvenc_reg_klut_ofst klut_ofst = { .val = 0 };
+		unsigned int i;
+
+		for (i = 0; i < 4; i++) {
+			u32 word = aq_tthd[4 * i] | (aq_tthd[4 * i + 1] << 8) |
+				   (aq_tthd[4 * i + 2] << 16) | (aq_tthd[4 * i + 3] << 24);
+
+			rkvenc_write_relaxed(dev, RKVENC_REG_AQ_TTHD + 4 * i, word);
+		}
+
+		aq_stp0.aq_stp_s0 = aq_step[0]; aq_stp0.aq_stp_0t1 = aq_step[1];
+		aq_stp0.aq_stp_1t2 = aq_step[2]; aq_stp0.aq_stp_2t3 = aq_step[3];
+		aq_stp0.aq_stp_3t4 = aq_step[4]; aq_stp0.aq_stp_4t5 = aq_step[5];
+		rkvenc_write_relaxed(dev, RKVENC_REG_AQ_STP0, aq_stp0.val);
+
+		/* aq_stp_7t8 is a hardcoded 0 in mpp's setup_vepu510_aq(), not
+		 * aq_step[8] -- a genuine off-by-one quirk in the vendor HAL
+		 * (aq_step[8..10] shift into aq_stp_8t9..10t11 instead), real
+		 * hardware expects exactly this mapping so it's reproduced
+		 * verbatim rather than "corrected".
+		 */
+		aq_stp1.aq_stp_5t6 = aq_step[6]; aq_stp1.aq_stp_6t7 = aq_step[7];
+		aq_stp1.aq_stp_7t8 = 0; aq_stp1.aq_stp_8t9 = aq_step[8];
+		aq_stp1.aq_stp_9t10 = aq_step[9]; aq_stp1.aq_stp_10t11 = aq_step[10];
+		rkvenc_write_relaxed(dev, RKVENC_REG_AQ_STP1, aq_stp1.val);
+
+		aq_stp2.aq_stp_11t12 = aq_step[11]; aq_stp2.aq_stp_12t13 = aq_step[12];
+		aq_stp2.aq_stp_13t14 = aq_step[13]; aq_stp2.aq_stp_14t15 = aq_step[14];
+		aq_stp2.aq_stp_b15 = aq_step[15];
+		rkvenc_write_relaxed(dev, RKVENC_REG_AQ_STP2, aq_stp2.val);
+
+		madi_st_thd.madi_th0 = 5;
+		madi_st_thd.madi_th1 = 12;
+		madi_st_thd.madi_th2 = 20;
+		rkvenc_write_relaxed(dev, RKVENC_REG_MADI_ST_THD, madi_st_thd.val);
+
+		madp_st_thd0.madp_th0 = 4 << 4;
+		madp_st_thd0.madp_th1 = 9 << 4;
+		rkvenc_write_relaxed(dev, RKVENC_REG_MADP_ST_THD0, madp_st_thd0.val);
+
+		madp_st_thd1.madp_th2 = 15 << 4;
+		rkvenc_write_relaxed(dev, RKVENC_REG_MADP_ST_THD1, madp_st_thd1.val);
+
+		klut_ofst.chrm_klut_ofst = 6;
+		rkvenc_write_relaxed(dev, RKVENC_REG_KLUT_OFST, klut_ofst.val);
+	}
+
 	/* PARAM/SQI: mpp's default-tuning constant tables -- see the comment
 	 * on rkvenc_par_class/rkvenc_sqi_class above. SCL: this driver never
 	 * uses a custom H.264 scaling list, so the whole class is zero --
@@ -753,9 +822,15 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		rkvenc_write_relaxed(dev, RKVENC_REG_ME_CACH, me_cach.val);
 	}
 
-	/* Matches setup_vepu510_rdo_pred()'s derivation in the vendor HAL. */
+	/* Matches setup_vepu510_rdo_pred()'s derivation in the vendor HAL.
+	 * chrm_spcl/ccwa_e/atr_mult_sel_e are unconditional 1s in mpp
+	 * regardless of profile/level/tune config -- see rkvenc-regs.h.
+	 */
 	rdo_cfg.rect_size = !is_main && rkvenc_h264_level_idc[h264->level->val] <= 30;
 	rdo_cfg.vlc_lmt = !is_main && !cabac;
+	rdo_cfg.chrm_spcl = 1;
+	rdo_cfg.ccwa_e = 1;
+	rdo_cfg.atr_mult_sel_e = 1;
 	rkvenc_write_relaxed(dev, RKVENC_REG_RDO_CFG, rdo_cfg.val);
 
 	synt_nal.nal_ref_idc = 1;
@@ -798,6 +873,17 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	enc_pic.pic_qp = qp;
 	enc_pic.slen_fifo = 1; /* forced on for every VEPU510 task, see rkvenc-regs.h */
 	enc_pic.rec_fbc_dis = 0;
+	/* mpp's hal_h264e_vepu510_gen_regs() sets this whenever a real
+	 * motion-detection-info buffer is provided (mei_stor = task->md_info
+	 * ? 1 : 0) -- this driver always provides one (meiw_buf_dma below),
+	 * so this must always be 1 too. Previously left 0 despite the address
+	 * being valid: a mismatch between "here's a real buffer" and "don't
+	 * actually store to it" that plausibly only bites once the ME engine
+	 * has real motion-vector output to write, i.e. genuine inter-frame
+	 * (P-frame) search -- an I-frame's trivial/absent ME activity may
+	 * never actually exercise the write-enable path this gates.
+	 */
+	enc_pic.mei_stor = 1;
 
 	/* Control-class (Vepu510ControlCfg) setup, matching mpp's
 	 * setup_vepu510_normal() field-for-field — see rkvenc-regs.h banner

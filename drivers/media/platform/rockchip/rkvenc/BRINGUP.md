@@ -223,12 +223,57 @@ output, not guessed:
    reference data, that frame 0's degenerate aliased case never
    exercised — not yet root-caused.
 
-   **Next step (not started)**: the methodology that solved the original
-   I-frame stall (build+run rockchip-linux/mpp's own `mpi_enc_test`,
-   diff its real register writes against this driver's) needs to be
-   redone with a genuine **multi-frame** capture — the single-frame
-   capture used before literally cannot show what correct P-frame
-   register content looks like, since it only ever encoded one I-frame.
+   **Update 2026-07-21, theoretical audit (not yet board-tested)**: instead
+   of a fresh multi-frame board capture, this was root-caused by diffing
+   this driver's register writes directly against a real checkout of
+   rockchip-linux/mpp's own `hal_h264e_vepu510.c` (the actual field-level
+   source for every register this driver reconstructs manually, as opposed
+   to the raw wtrace byte capture used for PARAM/SQI). That diff found
+   three concrete, real gaps, all now fixed:
+   - `enc_pic.mei_stor` was always left 0, even though this driver always
+     provides a real `meiw_addr` (motion-detection-info buffer). mpp's
+     `hal_h264e_vepu510_gen_regs()` sets `mei_stor = task->md_info ? 1 : 0`
+     unconditionally — i.e. real hardware expects `mei_stor=1` whenever a
+     valid address is given, not just "if the caller feels like it." Since
+     real motion-vector output only exists on inter (P) frames — an I-frame
+     has no genuine ME search to write out — this specific mismatch
+     (a valid address paired with "don't actually store to it") is a
+     strong candidate for something in the ME-output write path never
+     signaling completion, backing up until the watchdog fires. Fixed:
+     `enc_pic.mei_stor = 1;` in `rkvenc_h264_run()`.
+   - `rdo_cfg.chrm_spcl`/`ccwa_e`/`atr_mult_sel_e` — three bits mpp's
+     `setup_vepu510_rdo_pred()` sets unconditionally to 1 on every frame
+     (unlike `rect_size`/`vlc_lmt`/`atf_e`/`atr_e`, which really are
+     profile/tune-conditional) — were simply never set by this driver at
+     all. Fixed.
+   - A whole tail of the RC_ROI register class (0x1044-0x107c: the AQ
+     activity threshold/step LUT, MAD-statistics thresholds, and a chroma
+     KLUT offset — real fields in mpp's `Vepu510RcRoi` struct, set by
+     `setup_vepu510_aq()`/`setup_vepu510_me()`/`setup_vepu510_rdo_pred()`)
+     was never written at all — not wrong values, just entirely absent
+     writes, left at POR/leftover 0. This sits in the *exact* register
+     class board bring-up already proved needs non-degenerate content for
+     the hardware to complete at all (see the RC_ROI banner comment in
+     rkvenc-regs.h re: `rc_dthd_0_8`) — a very plausible source of a real
+     internal stall, that would only get exercised once genuine per-block
+     activity/MAD statistics start getting computed and compared against
+     these thresholds during real inter-mode (P-frame) analysis. Fixed —
+     see `RKVENC_REG_AQ_TTHD` and friends in rkvenc-regs.h/rkvenc-h264.c.
+
+   None of these are guesses about *values* — all three are grounded in
+   reading mpp's actual field-setup functions line by line, not another
+   round of "try a plausible constant and see." Compiles clean (`W=1`, zero
+   warnings) and is packaged into a fresh `sdcard.img`, but deliberately
+   **not board-tested yet** in this pass — the point of doing the diff
+   this way was to stop guess-and-flash iteration and fix everything the
+   ground truth actually disagrees with in one pass before the next board
+   test, rather than trying one experimental register at a time again.
+   **Next step**: flash and re-run the multi-frame test tool. If P-frames
+   still hang after this, the next escalation is the original plan (a
+   genuine multi-frame mpp capture for a byte-level diff), since at that
+   point the remaining gap would no longer be an omitted field but
+   something this driver's manual per-field reconstruction still gets
+   wrong in a way a source read didn't catch.
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).
