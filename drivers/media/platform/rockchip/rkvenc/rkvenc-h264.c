@@ -22,6 +22,7 @@
 
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/log2.h>
 #include <linux/moduleparam.h>
 
@@ -54,6 +55,20 @@ MODULE_PARM_DESC(force_all_idr, "DIAG: encode every frame as IDR (gop_size=1 equ
 static bool force_self_ref;
 module_param(force_self_ref, bool, 0644);
 MODULE_PARM_DESC(force_self_ref, "DIAG: P-frames read their own empty recon slot, not the real reference");
+
+/* pre_kick_iommu_flush / pre_kick_delay_us: candidate barriers for the
+ * confirmed inter-frame FBC-reconstruction write-to-read hazard (the prior
+ * frame's recon isn't settled when the next frame reads it). If either makes
+ * the real-reference P-frames complete, the fix is a proper pre-kick
+ * drain/barrier. See rkvenc_h264_run().
+ */
+static bool pre_kick_iommu_flush;
+module_param(pre_kick_iommu_flush, bool, 0644);
+MODULE_PARM_DESC(pre_kick_iommu_flush, "DIAG: iommu_flush_iotlb_all before ENC_START");
+
+static unsigned int pre_kick_delay_us;
+module_param(pre_kick_delay_us, uint, 0644);
+MODULE_PARM_DESC(pre_kick_delay_us, "DIAG: udelay(N) before ENC_START to let the reference settle");
 
 /* SPS log2_max_frame_num_minus4 / log2_max_pic_order_cnt_lsb_minus4: both
  * fixed at 4 (8-bit fields) so frame_num/poc_lsb wrap well past any sane
@@ -1080,6 +1095,28 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
 
 		wmb(); /* all task registers visible before the kick below */
+
+		/* TEMPORARY diagnostics (see BRINGUP.md): the P-frame hang was
+		 * localized to an inter-frame write-to-read hazard -- the prior
+		 * frame's FBC reconstruction isn't fully settled/visible when this
+		 * frame's ME reads it as the reference (reading a self/settled slot
+		 * completes; reading the immediately-prior fresh recon hangs; a
+		 * reset/warmup makes it work). Test the two candidate barriers:
+		 *   pre_kick_iommu_flush -- the vendor's per-submit IOMMU flush this
+		 *     driver omits; also an ordering/visibility barrier.
+		 *   pre_kick_delay_us -- a crude settle delay; if this alone fixes
+		 *     the P-hang, the real fix is a proper drain/barrier, not a
+		 *     delay. Only P-frames read a real reference, so this only needs
+		 *     to matter there, but apply unconditionally for a clean test.
+		 */
+		if (pre_kick_iommu_flush) {
+			struct iommu_domain *dom = iommu_get_domain_for_dev(dev->dev);
+
+			if (dom)
+				iommu_flush_iotlb_all(dom);
+		}
+		if (pre_kick_delay_us)
+			udelay(pre_kick_delay_us);
 
 		enc_strt.lkt_num = 0;
 		enc_strt.vepu_cmd = RKVENC_VEPU_CMD_ENC;
