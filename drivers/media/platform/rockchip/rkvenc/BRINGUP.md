@@ -324,10 +324,50 @@ output, not guessed:
 
    All of the above are grounded in an exact, programmatically-verified
    diff against real register writes on real silicon across a genuine
-   3-frame session — not source-reading, not another guess. Compiles clean,
-   packaged into a fresh `sdcard.img`. **Still not board-tested with this
-   combined set** (the ATR/smear/nal_ref_idc fixes came right after the
-   multi-frame capture, in the same pass) — next step is exactly that.
+   3-frame session — not source-reading, not another guess.
+
+   **Board-tested 2026-07-21**: real but partial progress, not a fix.
+   `bs_scp` confirmed live via readback (`enc_pic` `0x40001c0c`→`0x40001c1c`,
+   bit4 set), and the failure point moved a little further into the frame
+   (`bs_lgth` `0x86`→`0x8a`, 134→138 bytes) — so these are real fixes, just
+   not sufficient. The P-frame hardware watchdog still fires on every
+   P-frame, same `int_sta=0x100 (wdg)`.
+
+   **DEBUG-class readback tried and came back NEGATIVE.** Added a dump of
+   `0x5100`-`0x515c` (the same range the downstream vendor kernel's own
+   genuine-timeout path reads, `rkvenc2_task_timeout_process()` in
+   mpp_rkvenc2.c) on every frame completion, success or failure, so an
+   I-frame baseline and a hung P-frame's values would land in the same log.
+   Result: **all 24 words were byte-for-byte identical** between the
+   successful I-frame and all 9 failed P-frames. Either this range is
+   static config/version data rather than live counters, or reading it via
+   a plain `readl()` doesn't capture whatever actually differs (may need a
+   snapshot/latch trigger this driver doesn't know about). This specific
+   diagnostic avenue is exhausted — don't re-try a bare readback of this
+   range without a new reason to think it would behave differently.
+
+   A logic analyzer was considered and ruled out: VEPU510 is an on-die IP
+   block (MMIO-mapped, no externally observable bus/pins), so external
+   signal capture can't see anything happening inside the engine — real
+   SoC-internal tracing would need JTAG/CoreSight-class tooling instead,
+   a different (and likely fused-off) class of access.
+
+   **Not yet tried, considered promising** (the actual vendor mpp/kernel
+   source being open is exactly why these remain worth trying before
+   escalating further):
+   - Real (non-synthetic) image content through a fresh multi-frame vendor
+     capture — this driver's and mpp's synthetic test patterns differ
+     (`fill_image()` vs this driver's own gradient), and while the vendor's
+     own synthetic pattern already encodes fine on real hardware (weakening
+     but not eliminating a content-dependency theory), a real-content
+     capture would close the loop and might also reveal register content
+     this driver hasn't seen from a synthetic-only capture.
+   - A different resolution — cheap to try immediately without a rebuild,
+     since `vepu-test` already takes width/height as CLI args
+     (`vepu-test /dev/video0 <w> <h> <out> <num_frames>`). If a different
+     resolution's P-frames DON'T hang, that's a strong, specific new clue
+     (something alignment/size-dependent); if they hang identically, that
+     rules out resolution as a factor cleanly.
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).
