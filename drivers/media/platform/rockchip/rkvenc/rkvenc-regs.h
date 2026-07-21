@@ -515,6 +515,15 @@ union rkvenc_reg_synt_sli2 {
 #define RKVENC_REG_BSBB_ADDR		0x2b4
 #define RKVENC_REG_ADR_BSBS		0x2b8
 #define RKVENC_REG_BSBR_ADDR		0x2bc
+/* Auxiliary write/read pointers this driver doesn't use for real data but
+ * which the hardware still issues writes through (see the scratch-buffer
+ * handling and big comment in rkvenc_h264_run()): loop-filter write/read
+ * and the ext-line top/bottom buffers.
+ */
+#define RKVENC_REG_LPFW_ADDR		0x2c0
+#define RKVENC_REG_LPFR_ADDR		0x2c4
+#define RKVENC_REG_EBUFT_ADDR		0x2c8
+#define RKVENC_REG_EBUFB_ADDR		0x2cc
 /* rfpt/rfpb ("top"/"bottom" field recon addresses, interlaced-only):
  * real capture always carries the literal sentinel 0xffffffff in
  * rfpt_h/rfpt_b (not an fd-embedded pointer -- an fd of 0x3ff/1023 is

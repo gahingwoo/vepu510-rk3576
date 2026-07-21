@@ -155,6 +155,23 @@ struct rkvenc_h264_ctx {
 	 */
 	void *meiw_buf_cpu;
 	dma_addr_t meiw_buf_dma;
+
+	/* Catch-all scratch buffer for the FRAME-class auxiliary write
+	 * pointers this driver doesn't otherwise use (loop-filter write
+	 * lpfw_addr 0x2c0, ext-line ebuft/ebufb 0x2c8/0x2cc, the "online"
+	 * pointers 0x270-0x27c, and 0x29c/0x2a0). The downstream vendor leaves
+	 * all of these at 0 and its hardware never writes through them, but on
+	 * this driver the hardware DOES issue a write through (at least) one of
+	 * them -- proven by board bring-up: after zeroing the block the
+	 * long-standing rk_iommu write fault simply moved from a stale-garbage
+	 * IOVA to 0x0. Pointing them all at one real, generously-sized DMA
+	 * buffer makes any such write land in valid memory instead of faulting.
+	 * Sized like a full recon buffer so even a full-frame-sized spurious
+	 * write fits.
+	 */
+	void *scratch_buf_cpu;
+	dma_addr_t scratch_buf_dma;
+	size_t scratch_buf_size;
 };
 
 struct rkvenc_ctx {

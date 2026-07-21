@@ -392,6 +392,21 @@ static int rkvenc_h264_start(struct rkvenc_ctx *ctx)
 		return -ENOMEM;
 	}
 
+	/* Catch-all scratch buffer for the auxiliary FRAME-class write
+	 * pointers (see the field comment in rkvenc.h). Sized like a full
+	 * recon buffer so even a full-frame-sized spurious write fits.
+	 */
+	h264->scratch_buf_size = total_size;
+	h264->scratch_buf_cpu = dma_alloc_coherent(dev->dev, h264->scratch_buf_size,
+						   &h264->scratch_buf_dma, GFP_KERNEL);
+	if (!h264->scratch_buf_cpu) {
+		dma_free_coherent(dev->dev, SZ_4K, h264->meiw_buf_cpu, h264->meiw_buf_dma);
+		for (i = 0; i < 2; i++)
+			dma_free_coherent(dev->dev, total_size,
+					  h264->recn_buf_cpu[i], h264->recn_buf_dma[i]);
+		return -ENOMEM;
+	}
+
 	rkvenc_h264_gen_sps_pps(ctx);
 
 	return 0;
@@ -415,6 +430,11 @@ static void rkvenc_h264_stop(struct rkvenc_ctx *ctx)
 	if (h264->meiw_buf_cpu)
 		dma_free_coherent(dev->dev, SZ_4K, h264->meiw_buf_cpu, h264->meiw_buf_dma);
 	h264->meiw_buf_cpu = NULL;
+
+	if (h264->scratch_buf_cpu)
+		dma_free_coherent(dev->dev, h264->scratch_buf_size,
+				  h264->scratch_buf_cpu, h264->scratch_buf_dma);
+	h264->scratch_buf_cpu = NULL;
 }
 
 /* VEPU510-only quirk sequence, written unconditionally on every task by
@@ -512,20 +532,43 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	 * reading a bad reference (and why a larger resolution, whose stale
 	 * pointer lands somewhere more essential, fails even the I-frame).
 	 *
-	 * Zeroing the FRAME-class address/pointer block first (then overwriting
-	 * the specific registers below) reproduces the vendor's "every register
-	 * defined every frame" invariant with a single cheap loop, rather than
-	 * enumerating every skipped register by hand. The block 0x270-0x2ec is
-	 * exactly where every DMA write pointer lives; the syntax registers at
-	 * 0x300+ that this driver skips (e.g. 0x3c8-0x3f4) are non-pointer and
-	 * so carry no wild-write risk, but they are all written explicitly with
-	 * real values or left correct-at-zero elsewhere anyway.
+	 * Board bring-up proved the previous "zero the whole block" version was
+	 * necessary but not sufficient: after zeroing, the fault simply moved
+	 * from a stale-garbage IOVA to 0x0 -- i.e. the hardware really does
+	 * issue a write through one of these pointers, and 0 is just as
+	 * unmapped as garbage. So instead of zeroing them, point every
+	 * FRAME-class pointer this driver doesn't otherwise use at a real
+	 * scratch DMA buffer, so any such write lands in valid memory. First
+	 * zero the whole block (defines every register, matching the vendor's
+	 * full-file write), then set the auxiliary write pointers to scratch;
+	 * the specific real pointers (src/rfpw/rfpr/dspw/dspr/meiw/bsb/smear)
+	 * are written with their real values further below and overwrite the
+	 * zeros. The syntax registers at 0x300+ this driver skips are
+	 * non-pointer and carry no wild-write risk.
 	 */
 	{
 		u32 off;
 
 		for (off = RKVENC_REG_FRAME_OFFSET; off <= RKVENC_REG_ADR_ROIR; off += 4)
 			rkvenc_write_relaxed(dev, off, 0);
+
+		/* "online"/DVBM source pointers (0x270-0x27c), the two unnamed
+		 * pointers at 0x29c/0x2a0, the loop-filter write/read pointers
+		 * (lpfw 0x2c0 / lpfr 0x2c4), and the ext-line buffers (ebuft
+		 * 0x2c8 / ebufb 0x2cc) -- all left unused by this driver. Any of
+		 * these the hardware writes through now hits the scratch buffer.
+		 */
+		rkvenc_write_relaxed(dev, RKVENC_REG_FRAME_OFFSET + 0x00, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_FRAME_OFFSET + 0x04, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_FRAME_OFFSET + 0x08, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_FRAME_OFFSET + 0x0c, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, 0x29c, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, 0x2a0, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_LPFW_ADDR, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_LPFR_ADDR, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_EBUFT_ADDR, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_EBUFB_ADDR, h264->scratch_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_ADR_ROIR, h264->scratch_buf_dma);
 	}
 
 	/* TEMPORARY diagnostic for the isolated rk_iommu write-fault seen on
