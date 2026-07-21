@@ -194,6 +194,41 @@ output, not guessed:
    impact) rather than a blocker — don't resume blind attempts here
    without a genuinely new lead (new instrumentation data, not another
    register guess).
+0.5 **CONFIRMED BROKEN: P-frames hang the hardware watchdog, every time.**
+   Board-tested 2026-07-21 with a new multi-frame test mode (see
+   `vepu-test.c`'s `num_frames` argument). Frame 0 (I-frame, `gop_pos==0`)
+   succeeds exactly as always (`bytesused` correct, `KEYFRAME` flag, no
+   error). **Frame 1 onward — every real P-frame — fails with a genuine
+   hardware watchdog** (`encode error, int_sta=0x00000100 (error bits:
+   wdg)`), not the cosmetic IOMMU fault above. Confirmed via the
+   temporary `dev_info()` address dump that this is genuinely exercising
+   the real, non-aliased ping-pong path for the first time ever:
+   `recn[w=1]=<slot 1> recn[r=0]=<slot 0>` — reading frame 0's actual
+   reconstruction, not an alias of the write buffer (frame 0's own
+   `read_idx==write_idx` special case never touches this). This is
+   exactly the FBC-reference-buffer read path this README has always
+   flagged as "the least-verified part of the driver" (see the bring-up
+   checklist below) — now confirmed actually broken, not just
+   theoretically risky.
+
+   Notable: `bs_lgth` was nonzero (134 bytes) at the moment the watchdog
+   fired — the hardware made real partial progress before hanging, not
+   an instant failure. The per-frame control registers looked internally
+   consistent for the P-frame case (QP correctly switched `i_qp`→`p_qp`,
+   `synt_sli0` correctly showed `sli_type=P`/incremented `frm_num`) — no
+   obviously-wrong value spotted yet in what this driver already
+   computes. Most likely explanation: something about how the hardware
+   actually consumes real (non-self-referencing) recon/thumb/smear
+   content, or motion-estimation search behavior against genuine
+   reference data, that frame 0's degenerate aliased case never
+   exercised — not yet root-caused.
+
+   **Next step (not started)**: the methodology that solved the original
+   I-frame stall (build+run rockchip-linux/mpp's own `mpi_enc_test`,
+   diff its real register writes against this driver's) needs to be
+   redone with a genuine **multi-frame** capture — the single-frame
+   capture used before literally cannot show what correct P-frame
+   register content looks like, since it only ever encoded one I-frame.
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).
@@ -218,13 +253,15 @@ output, not guessed:
 ## First hardware bring-up checklist
 
 - Confirm probe succeeds and both `/dev/videoN` nodes appear.
-- Run `/opt/npu-test/vepu-test` for a single IDR frame (GOP size 1) —
-  this is the actual test loop that found bugs 1-3 above. Check
-  `encoded frame: bytesused=` is nonzero and `flags` does NOT have
+- Run `/opt/npu-test/vepu-test` for a single IDR frame (default, or pass
+  `1` as the 5th arg / omit it and Ctrl-C after frame 0) — this is the
+  test loop that found bugs 1-3 above and is confirmed reliably working.
+  Check `encoded frame: bytesused=` is nonzero and `flags` does NOT have
   `V4L2_BUF_FLAG_ERROR` (0x40) set; check the first 16 bytes match
   `00 00 00 01 27 ... 00 00 00 01 28 ... 00 00 00 01 25`.
-  Watch `dmesg` for `rk_iommu` faults (missing buffer pointer) or
-  `encode timeout, resetting core` (watchdog fired — item 1 above).
-- P-frames exercise the FBC reference-*read* path (as opposed to the
-  write path every frame already touches) for the first time — bring
-  up IDR-only first.
+  Watch `dmesg` for `rk_iommu` faults (see known gap 0 — cosmetic, not
+  blocking) or `encode timeout, resetting core` (watchdog fired).
+- `vepu-test` also takes a `num_frames` argument (default 10) to test
+  P-frames — **currently known to fail every time from frame 1 onward**,
+  see known gap 0.5 above. Don't spend more bring-up time on multi-frame
+  testing until that's root-caused; single-IDR-frame use is solid.
