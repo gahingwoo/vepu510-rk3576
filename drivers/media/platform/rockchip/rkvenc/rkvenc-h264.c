@@ -930,7 +930,6 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	enc_pic.enc_stnd = RKVENC_ENC_STND_H264;
 	enc_pic.cur_frm_ref = 1;
 	enc_pic.pic_qp = qp;
-	enc_pic.slen_fifo = 1; /* forced on for every VEPU510 task, see rkvenc-regs.h */
 	enc_pic.rec_fbc_dis = 0;
 	/* mpp's setup_vepu510_codec() sets this unconditionally to 1 on every
 	 * frame; confirmed not just from source but from the real vendor
@@ -949,11 +948,43 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	 * never actually exercise the write-enable path this gates.
 	 */
 	enc_pic.mei_stor = 1;
+	/* slen_fifo is deliberately left 0 for this FIRST ENC_PIC write. The
+	 * vendor arms the slice-length FIFO in a two-step sequence: ENC_PIC is
+	 * written with slen_fifo=0 during setup, then RE-written with
+	 * slen_fifo=1 as the very last register before ENC_START. A real
+	 * multi-frame wtrace capture shows this on EVERY frame (I and both P):
+	 * 0x300 written twice, e.g. P-frame `0x00001a1c` (slen_fifo=0) early
+	 * then `0x40001a1c` (slen_fifo=1) at the kick. This driver previously
+	 * wrote ENC_PIC once with slen_fifo=1 and then wrote DUAL_CORE after
+	 * it -- so it never reproduced the vendor's "arm the FIFO as the final
+	 * action immediately before the kick" ordering. That two-step arm is
+	 * the strongest-remaining register-level difference for the P-frame
+	 * hang: the I-frame limps through without it, but a P-frame produces
+	 * genuine slice-FIFO traffic that may depend on the FIFO being armed
+	 * last. See the kick sequence below.
+	 */
+	enc_pic.slen_fifo = 0;
 
-	/* Control-class (Vepu510ControlCfg) setup, matching mpp's
-	 * setup_vepu510_normal() field-for-field — see rkvenc-regs.h banner
-	 * comment for why this supersedes an earlier, wrong reading of these
-	 * same registers.
+	/* First ENC_PIC write (slen_fifo=0) and DUAL_CORE, both in the
+	 * vendor's early "config" position -- the capture writes 0x300
+	 * (slen_fifo=0) and 0x304=0x14 together in the FRAME-class region,
+	 * well before the kick, NOT interleaved into the kick tail.
+	 *
+	 * DUAL_CORE=0x14: see the union rkvenc_reg_dual_core comment in
+	 * rkvenc-regs.h. Confirmed written once per frame (seq62/714/1366 in
+	 * the multi-frame capture) even for this fully standalone single-core
+	 * encode; leaving it 0 did NOT stop the isolated rk_iommu fault.
+	 */
+	rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
+	rkvenc_write_relaxed(dev, RKVENC_REG_DUAL_CORE, 0x14);
+
+	/* Control-class (Vepu510ControlCfg) setup + the vendor's exact kick
+	 * tail. The kick order is transcribed verbatim from a real multi-frame
+	 * wtrace capture (the last writes of every frame, identical across I
+	 * and both P frames):
+	 *   ENC_WDG(0x38) -> DVBM_HOLD(0x74) -> ENC_ID(0x308) -> INT_EN(0x20)
+	 *   -> ENC_PIC(0x300, slen_fifo=1) -> ENC_START(0x10)
+	 * with ENC_PIC (FIFO-armed) as the final config write before the kick.
 	 */
 	{
 		union rkvenc_reg_int_bits int_en = { .val = 0 };
@@ -964,7 +995,7 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		int_en.enc_done = 1;
 		int_en.lkt_node_done = 1;
 		int_en.sclr_done = 1;
-		int_en.vslc_done = 1; /* mirrors enc_pic.slen_fifo, forced on above */
+		int_en.vslc_done = 1; /* mirrors enc_pic.slen_fifo armed below */
 		int_en.vbsf_oflw = 1;
 		int_en.vbuf_lens = 1;
 		int_en.enc_err = 1;
@@ -976,8 +1007,13 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		int_en.jslc_done = 1;
 		int_en.jbsf_oflw = 1;
 		int_en.jbuf_lens = 1;
-		rkvenc_write_relaxed(dev, RKVENC_REG_INT_EN, int_en.val);
-		rkvenc_write_relaxed(dev, RKVENC_REG_INT_MASK, 0); /* unmask everything above */
+
+		/* Early config writes (the vendor emits these in its linear
+		 * offset-ordered dump, well before the kick): INT_MASK, OPT_STRG,
+		 * DTRNS_MAP. INT_EN itself is deferred to the kick tail below to
+		 * match the capture (INT_EN is re-written right before ENC_PIC).
+		 */
+		rkvenc_write_relaxed(dev, RKVENC_REG_INT_MASK, 0);
 
 		opt_strg.cke = 1;
 		opt_strg.resetn_hw_en = 1;
@@ -986,38 +1022,17 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		dtrns_map.bsw_bus_edin = 7;
 		rkvenc_write_relaxed(dev, RKVENC_REG_DTRNS_MAP, dtrns_map.val);
 
+		/* ---- exact vendor kick tail ---- */
 		rkvenc_write(dev, RKVENC_REG_ENC_WDG, rkvenc_calc_wdg(dev, width, height));
+		rkvenc_vepu510_quirk(dev); /* DVBM_HOLD(0x74) + ENC_ID(0x308) */
+		rkvenc_write_relaxed(dev, RKVENC_REG_INT_EN, int_en.val);
 
-		rkvenc_vepu510_quirk(dev);
+		/* Final ENC_PIC re-write with slen_fifo=1 -- arms the slice-length
+		 * FIFO as the very last action before ENC_START, matching the
+		 * capture exactly. This is the whole point of the two-step arm.
+		 */
+		enc_pic.slen_fifo = 1;
 		rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
-
-		/* CCU dual-core handshake register -- see the union
-		 * rkvenc_reg_dual_core comment in rkvenc-regs.h for why this
-		 * can't just be left unwritten. Writing plain 0 (fully
-		 * disabled: dchs_txe=dchs_rxe=0) did NOT stop an isolated
-		 * rk_iommu write fault seen on board bring-up, despite being
-		 * the more conservative-looking choice -- use the vendor
-		 * kernel's own real captured value instead (0x14, i.e.
-		 * dchs_txe=1) since that's what a real, working, fault-free
-		 * encode on this exact hardware actually uses, even for a
-		 * fully standalone non-chained task. "Disabled" apparently
-		 * isn't the same as "inert" for this register.
-		 */
-		rkvenc_write_relaxed(dev, RKVENC_REG_DUAL_CORE, 0x14);
-
-		/* EXPERIMENT, RESULT NEGATIVE (see git log): an explicit full
-		 * IOTLB flush right here (iommu_flush_iotlb_all() on the
-		 * device's domain), matching a real working reference driver
-		 * for the sibling VEPU580 IP
-		 * (rcawston/rockchip-rk3588-mainline-patches), was tried as a
-		 * hypothesis for the isolated rk_iommu fault below. Didn't
-		 * stop it, and combined with other experimental changes at the
-		 * time, board testing showed a real regression (every frame
-		 * failing with a genuine hardware watchdog under multi-frame
-		 * testing) -- not confirmed this specific change caused it
-		 * (three things changed at once), but reverted along with the
-		 * others pending isolated re-testing.
-		 */
 
 		wmb(); /* all task registers visible before the kick below */
 
