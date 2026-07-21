@@ -99,6 +99,14 @@ struct rkvenc_h264_ctx {
 	unsigned int gop_pos;
 	unsigned int idr_pic_id;
 
+	/* Whether the *previous* encoded frame was an IDR -- mpp's
+	 * setup_vepu510_anti_smear() keys smear_opt_cfg.stated_mode off both
+	 * the current slice type AND the previous frame's, see rkvenc-regs.h.
+	 * Zeroed by rkvenc_h264_start()'s memset; doesn't matter for frame 0
+	 * (always IDR regardless).
+	 */
+	bool last_frame_was_idr;
+
 	/* Software-synthesized SPS/PPS, emitted (Annex-B) ahead of the first
 	 * hardware slice payload of each IDR access unit; see rkvenc-h264.c.
 	 */

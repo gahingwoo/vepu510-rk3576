@@ -274,6 +274,60 @@ output, not guessed:
    point the remaining gap would no longer be an omitted field but
    something this driver's manual per-field reconstruction still gets
    wrong in a way a source read didn't catch.
+
+   **Update 2026-07-21, board-tested — those 3 fixes made ZERO difference**
+   (byte-identical failure: same `bs_lgth=0x86`, same `enc_wdg=0x00021795`).
+   Confirmed via register readback that `mei_stor=1` really was live on
+   hardware, so this ruled those three out as the cause, not just as
+   unconfirmed. Mined the *original* single-I-frame wtrace capture further
+   (real silicon, not source) and found two more confirmed gaps: `bs_scp`
+   must be 1 (confirmed both in mpp source and in the real capture's
+   `0x300=0x4000191c`, bit4 set) — fixed. Also programmatically verified
+   the RC_ROI fix above field-by-field against that same real capture:
+   everything matched exactly except `aq_stp2`'s middle two fields, which
+   used the real captured values (3,5,7,7,8) instead of the compiled-in
+   default table (which itself doesn't quite match what this specific
+   `mpi_enc_test` invocation produced) — fixed.
+
+   **Then built and ran a real multi-frame (3-frame) vendor wtrace
+   capture** — this is the actual escalation, and it paid off. Diffing
+   frame0(I)/frame1(P)/frame2(P)'s real register writes against each other
+   found:
+   - **PARAM class ATR (anti-ringing) weights are genuinely I/P-slice-
+     dependent**, not the frame-invariant tuning blob this driver assumed.
+     `0x1744`/`0x1750`/`0x1754`/`0x1758` were identical across the two
+     P-frames but different from the I-frame — traced to mpp's
+     `setup_vepu510_anti_ringing()`, which has a real I-vs-P branch. This
+     driver's static `rkvenc_par_class` blob was captured from an
+     I-frame-only session, so every P-frame silently got the wrong
+     (I-slice) ATR weights the whole time. Fixed with a small per-frame
+     patch on top of the static blob, values confirmed exactly against the
+     real capture (see `RKVENC_REG_ATR_THD1`/`WGT16`/`WGT8`/`WGT4` in
+     rkvenc-regs.h).
+   - **SQI `smear_opt_cfg.stated_mode`** similarly depends on slice-type
+     *history* (1 if this slice or the *previous* one was I, else 2) —
+     confirmed exactly across all 3 frames (I:1, P-after-I:1, P-after-P:2).
+     Pure state this driver can and now does track (`last_frame_was_idr`).
+     Fixed. Its sibling field `rdo_smear_dlt_qp` genuinely depends on real
+     per-block smear statistics read back from the previous frame's
+     hardware counters (mpp's `ctx->last_frame_fb`) — this driver has no
+     such readback implemented, so it's approximated as a static per-slice-
+     type constant (-1 I / -3 P, matching what the real capture happened to
+     produce) rather than fully replicated; a real gap, but RDO-cost tuning
+     rather than known hang-relevant.
+   - **`synt_nal.nal_ref_idc` was hardcoded 1 for every frame** — the real
+     capture shows 3 for the IDR slice and 2 for P slices (both real
+     references, matching this driver's `cur_frm_ref=1`). Fixed. Spec-
+     compliance bug in the hardware-generated slice NAL header, not
+     expected to be hang-related (the hardware just emits whatever value
+     it's given).
+
+   All of the above are grounded in an exact, programmatically-verified
+   diff against real register writes on real silicon across a genuine
+   3-frame session — not source-reading, not another guess. Compiles clean,
+   packaged into a fresh `sdcard.img`. **Still not board-tested with this
+   combined set** (the ATR/smear/nal_ref_idc fixes came right after the
+   multi-frame capture, in the same pass) — next step is exactly that.
 1. **`0x74`/`0x308` VEPU510 quirk (`rkvenc_vepu510_quirk()`)** — required
    per the downstream vendor kernel driver, confirmed absent from the
    userspace mpp HAL entirely (so it can't be cross-checked there).

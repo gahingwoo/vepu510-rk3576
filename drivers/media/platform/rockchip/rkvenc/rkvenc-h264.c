@@ -752,8 +752,17 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		aq_stp1.aq_stp_9t10 = aq_step[9]; aq_stp1.aq_stp_10t11 = aq_step[10];
 		rkvenc_write_relaxed(dev, RKVENC_REG_AQ_STP1, aq_stp1.val);
 
-		aq_stp2.aq_stp_11t12 = aq_step[11]; aq_stp2.aq_stp_12t13 = aq_step[12];
-		aq_stp2.aq_stp_13t14 = aq_step[13]; aq_stp2.aq_stp_14t15 = aq_step[14];
+		/* aq_stp2's middle two fields (12t13/13t14) don't match
+		 * h264_P/I_aq_step_default's aq_step[12]/[13] verbatim -- cross-
+		 * checked against the real vendor wtrace capture from the
+		 * original I-frame bring-up (register 0x105c was 0x00839ca3
+		 * there), which decodes to 3/5/7/7/8, not 3/4/5/7/8. Using the
+		 * confirmed-real values for this one register instead of the
+		 * source-derived table, since real silicon is the higher-truth
+		 * source when the two disagree.
+		 */
+		aq_stp2.aq_stp_11t12 = aq_step[11]; aq_stp2.aq_stp_12t13 = 5;
+		aq_stp2.aq_stp_13t14 = 7; aq_stp2.aq_stp_14t15 = aq_step[14];
 		aq_stp2.aq_stp_b15 = aq_step[15];
 		rkvenc_write_relaxed(dev, RKVENC_REG_AQ_STP2, aq_stp2.val);
 
@@ -790,6 +799,48 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		for (off = RKVENC_REG_SCL_OFFSET;
 		     off < RKVENC_REG_SCL_OFFSET + RKVENC_REG_SCL_SIZE; off += 4)
 			rkvenc_write_relaxed(dev, off, 0);
+	}
+
+	/* ATR (anti-ringing) weights + smear_opt_cfg.stated_mode: patch the
+	 * handful of PARAM/SQI words that are genuinely I/P-slice-dependent on
+	 * top of the static blobs above -- see the CORRECTION banner comments
+	 * on RKVENC_REG_ATR_THD1 and RKVENC_REG_SMEAR_OPT_CFG in rkvenc-regs.h.
+	 * Values below are mpp's real setup_vepu510_anti_ringing()/
+	 * setup_vepu510_anti_smear() constants for this driver's non-IPC scene
+	 * mode, confirmed exactly against a real 3-frame wtrace capture.
+	 */
+	{
+		union rkvenc_reg_atr_thd1 atr_thd1 = { .val = 0 };
+		union rkvenc_reg_atr_wgt atr_wgt16 = { .val = 0 };
+		union rkvenc_reg_atr_wgt atr_wgt8 = { .val = 0 };
+		union rkvenc_reg_atr_wgt atr_wgt4 = { .val = 0 };
+		union rkvenc_reg_smear_opt_cfg smear_opt_cfg = { .val = 0 };
+
+		atr_thd1.thdqp = 45;
+		if (is_idr) {
+			atr_thd1.thd2 = 6;
+			atr_wgt16.wgt0 = 16; atr_wgt16.wgt1 = 16; atr_wgt16.wgt2 = 16;
+			atr_wgt8.wgt0 = 18; atr_wgt8.wgt1 = 17; atr_wgt8.wgt2 = 18;
+			atr_wgt4.wgt0 = 16; atr_wgt4.wgt1 = 16; atr_wgt4.wgt2 = 16;
+		} else {
+			atr_thd1.thd2 = 7;
+			atr_wgt16.wgt0 = 23; atr_wgt16.wgt1 = 22; atr_wgt16.wgt2 = 20;
+			atr_wgt8.wgt0 = 24; atr_wgt8.wgt1 = 24; atr_wgt8.wgt2 = 24;
+			atr_wgt4.wgt0 = 23; atr_wgt4.wgt1 = 22; atr_wgt4.wgt2 = 20;
+		}
+		rkvenc_write_relaxed(dev, RKVENC_REG_ATR_THD1, atr_thd1.val);
+		rkvenc_write_relaxed(dev, RKVENC_REG_ATR_WGT16, atr_wgt16.val);
+		rkvenc_write_relaxed(dev, RKVENC_REG_ATR_WGT8, atr_wgt8.val);
+		rkvenc_write_relaxed(dev, RKVENC_REG_ATR_WGT4, atr_wgt4.val);
+
+		smear_opt_cfg.rdo_smear_lvl16_multi = 16;
+		smear_opt_cfg.rdo_smear_en = 0;
+		smear_opt_cfg.stated_mode = (is_idr || h264->last_frame_was_idr) ? 1 : 2;
+		/* Static approximation of a real per-block-statistics-derived
+		 * value -- see the RKVENC_REG_SMEAR_OPT_CFG comment.
+		 */
+		smear_opt_cfg.rdo_smear_dlt_qp = is_idr ? -1 : -3;
+		rkvenc_write_relaxed(dev, RKVENC_REG_SMEAR_OPT_CFG, smear_opt_cfg.val);
 	}
 
 	/* Single slice per frame in v1. */
@@ -833,7 +884,15 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	rdo_cfg.atr_mult_sel_e = 1;
 	rkvenc_write_relaxed(dev, RKVENC_REG_RDO_CFG, rdo_cfg.val);
 
-	synt_nal.nal_ref_idc = 1;
+	/* mpp sets synt_nal.nal_ref_idc = slice->nal_reference_idc, which is
+	 * NOT a flat 1 for every frame -- a real 3-frame capture showed 3 for
+	 * the IDR slice and 2 for P slices (both real references, matching
+	 * this driver's unconditional enc_pic.cur_frm_ref=1). This driver
+	 * previously hardcoded 1 for both, a real spec-compliance gap in the
+	 * hardware-generated slice NAL header (not known to be hang-related --
+	 * the hardware just emits whatever value it's given).
+	 */
+	synt_nal.nal_ref_idc = is_idr ? 3 : 2;
 	synt_nal.nal_unit_type = is_idr ? 5 : 1;
 	rkvenc_write_relaxed(dev, RKVENC_REG_SYNT_NAL, synt_nal.val);
 
@@ -873,6 +932,12 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	enc_pic.pic_qp = qp;
 	enc_pic.slen_fifo = 1; /* forced on for every VEPU510 task, see rkvenc-regs.h */
 	enc_pic.rec_fbc_dis = 0;
+	/* mpp's setup_vepu510_codec() sets this unconditionally to 1 on every
+	 * frame; confirmed not just from source but from the real vendor
+	 * wtrace capture used for the original I-frame bring-up (0x300 was
+	 * 0x4000191c there, bit4 set) -- this driver had never set it at all.
+	 */
+	enc_pic.bs_scp = 1;
 	/* mpp's hal_h264e_vepu510_gen_regs() sets this whenever a real
 	 * motion-detection-info buffer is provided (mei_stor = task->md_info
 	 * ? 1 : 0) -- this driver always provides one (meiw_buf_dma below),
@@ -980,6 +1045,7 @@ static void rkvenc_h264_done(struct rkvenc_ctx *ctx, enum vb2_buffer_state state
 				  GENMASK(RKVENC_H264_LOG2_MAX_FRAME_NUM + 3, 0);
 		h264->poc_lsb = (h264->poc_lsb + 2) &
 				GENMASK(RKVENC_H264_LOG2_MAX_POC_LSB + 3, 0);
+		h264->last_frame_was_idr = is_idr;
 		if (++h264->gop_pos >= h264->gop_size->val)
 			h264->gop_pos = 0;
 		if (h264->gop_pos == 0)

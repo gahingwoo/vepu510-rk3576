@@ -821,18 +821,87 @@ union rkvenc_reg_klut_ofst {
  * a real successful encode via wtrace and cross-checked against the
  * table's monotonically-increasing-lambda shape, is a deliberate v1
  * choice, not a placeholder. See RKVENC_PAR_CLASS_WORDS in rkvenc-h264.c.
+ *
+ * CORRECTION (2026-07-21, from a real multi-frame wtrace capture): the
+ * "static blob, same for every frame" characterization above is WRONG for
+ * four specific words inside it -- mpp's setup_vepu510_anti_ringing()
+ * (hal_h264e_vepu510.c) computes real, different ATR (anti-ringing) weight
+ * values depending on I-slice vs P-slice, not just the tune/scene-mode
+ * config a single I-frame capture can see. A 3-frame real capture (frame 0
+ * I, frames 1-2 P) showed these four offsets change between the I-frame and
+ * BOTH P-frames, while staying identical between the two P-frames --
+ * conclusive evidence of an I/P split, not per-content noise. This driver's
+ * static `rkvenc_par_class` blob was captured from an I-frame-only session,
+ * so every P-frame was silently getting the I-slice ATR weights. See
+ * RKVENC_REG_ATR_THD1/WGT16/WGT8/WGT4 below and the patch in rkvenc-h264.c.
  */
 #define RKVENC_REG_PAR_OFFSET		0x1700
 #define RKVENC_REG_PAR_SIZE		0x02d0	/* 0x19cc - 0x1700 + 4 */
+
+#define RKVENC_REG_ATR_THD1		0x1744	/* thd2 (I/P-dependent) + thdqp (constant) */
+#define RKVENC_REG_ATR_WGT16		0x1750
+#define RKVENC_REG_ATR_WGT8		0x1754
+#define RKVENC_REG_ATR_WGT4		0x1758
+
+union rkvenc_reg_atr_thd1 {
+	struct {
+		u32 thd2:8;
+		u32 reserved0:8;
+		u32 thdqp:6;
+		u32 reserved1:10;
+	};
+	u32 val;
+};
+
+union rkvenc_reg_atr_wgt {
+	struct {
+		u32 wgt0:8;
+		u32 wgt1:8;
+		u32 wgt2:8;
+		u32 reserved:8;
+	};
+	u32 val;
+};
 
 /* ---- SQI class (0x2000-0x212c), "subjective Adjust" quant tuning.
  * Same default-tuning-profile characterization as PARAM above — a real
  * successful encode only ever wrote the first 0x2000-0x20b8 (the rest of
  * the declared class range was never touched even by a genuinely working
  * encode, so this driver doesn't write it either).
+ *
+ * CORRECTION (2026-07-21): same caveat as PARAM above applies to one word,
+ * smear_opt_cfg (0x2014, mpp's setup_vepu510_anti_smear()). Its
+ * `stated_mode` field is 1 if (this slice is I) OR (the *previous* encoded
+ * frame was I), else 2 -- a real multi-frame capture confirmed this exactly
+ * (frame 0 I: 1; frame 1 P, previous=I: 1; frame 2 P, previous=P: 2), pure
+ * slice-history state this driver can track trivially. Its
+ * `rdo_smear_dlt_qp` field is a genuinely different, harder case: mpp
+ * derives it from real per-block "smear" activity statistics read back from
+ * the *previous* frame's actual hardware encode (`ctx->last_frame_fb`,
+ * populated from DEBUG-class counters this driver has never implemented
+ * readback for) -- not just slice type. The capture showed -1 (I) then -3
+ * (both P frames), which this driver approximates as a static per-slice-
+ * type constant (real content-adaptive tracking is a follow-up, see
+ * README) since implementing full smear-statistics readback is out of
+ * scope here and this field's effect is RDO cost tuning, not known to be
+ * hang-relevant like the RC_ROI class was.
  */
 #define RKVENC_REG_SQI_OFFSET		0x2000
 #define RKVENC_REG_SQI_SIZE		0x00bc	/* 0x20b8 - 0x2000 + 4, not the full class */
+
+#define RKVENC_REG_SMEAR_OPT_CFG	0x2014
+
+union rkvenc_reg_smear_opt_cfg {
+	struct {
+		u32 rdo_smear_lvl16_multi:8;
+		s32 rdo_smear_dlt_qp:4;
+		u32 reserved:1;
+		u32 stated_mode:2;
+		u32 rdo_smear_en:1;
+		u32 reserved1:16;
+	};
+	u32 val;
+};
 
 /* ---- SCL class (0x2200-0x2584), scaling lists.
  * All-zero for any encode that doesn't use a custom H.264 scaling list
