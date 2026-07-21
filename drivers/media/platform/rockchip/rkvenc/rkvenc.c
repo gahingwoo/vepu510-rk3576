@@ -31,6 +31,7 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -523,6 +524,40 @@ static irqreturn_t rkvenc_irq(int irq, void *priv)
 	return done ? IRQ_WAKE_THREAD : IRQ_HANDLED;
 }
 
+/* Graceful core recovery after an error/timeout, mirroring the downstream
+ * vendor kernel's rkvenc_soft_reset() (mpp_rkvenc2.c): a SAFE clear via
+ * ENC_CLR drains the core's outstanding AXI transactions so the IOMMU can
+ * disable cleanly, then a FORCE clear + interrupt-state wipe returns the core
+ * to a defined state. Without this, a hung P-frame leaves the core wedged and
+ * an unacknowledged write fault stuck active, which cascades into the NEXT
+ * encode failing ("rk_iommu Disable paging request timed out"). Only ever
+ * called from the IRQ error path, so it can never touch a good frame; clocks
+ * are still enabled here (rkvenc_job_finish disables them afterwards).
+ */
+static void rkvenc_soft_reset(struct rkvenc_dev *dev)
+{
+	u32 sta;
+	int ret;
+
+	rkvenc_write(dev, RKVENC_REG_INT_MASK, 0x3ff);
+	rkvenc_write(dev, RKVENC_REG_ENC_CLR, RKVENC_ENC_CLR_SAFE);
+	ret = readl_relaxed_poll_timeout(dev->regs + RKVENC_REG_INT_STA, sta,
+					 sta & RKVENC_SCLR_DONE_STA, 0, 1000);
+	rkvenc_write(dev, RKVENC_REG_ENC_CLR, RKVENC_ENC_CLR_FORCE);
+	udelay(5);
+	rkvenc_write(dev, RKVENC_REG_ENC_CLR, 0);
+	rkvenc_write(dev, RKVENC_REG_INT_CLR, 0xffffffff);
+	rkvenc_write(dev, RKVENC_REG_INT_STA, 0);
+
+	if (ret) {
+		/* Safe clear never completed -- fall back to a full core reset. */
+		dev_warn(dev->dev, "safe reset timed out, forcing core reset\n");
+		reset_control_assert(dev->rst);
+		udelay(5);
+		reset_control_deassert(dev->rst);
+	}
+}
+
 static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 {
 	struct rkvenc_dev *dev = priv;
@@ -587,6 +622,13 @@ static irqreturn_t rkvenc_irq_thread(int irq, void *priv)
 			 rkvenc_read(dev, RKVENC_REG_ST_BS_LENGTH),
 			 rkvenc_read(dev, RKVENC_REG_ST_SLICE_NUM),
 			 rkvenc_read(dev, RKVENC_REG_ST_BSB));
+
+		/* Release the DVBM/encoder hold (only the drain-slices completion
+		 * path did this before) and gracefully reset the wedged core so
+		 * the fault is drained and the NEXT encode starts clean.
+		 */
+		rkvenc_write(dev, RKVENC_REG_ENC_ID, 0);
+		rkvenc_soft_reset(dev);
 	}
 
 	ctx->coded_desc->ops->done(ctx, state);

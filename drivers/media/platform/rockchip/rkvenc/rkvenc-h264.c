@@ -23,12 +23,37 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/log2.h>
+#include <linux/moduleparam.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "rkvenc.h"
 #include "rkvenc-regs.h"
+
+/* TEMPORARY diagnostics for the P-frame hardware-watchdog investigation (see
+ * BRINGUP.md). Toggleable at runtime via
+ * /sys/module/rockchip_vepu510/parameters/ so several hypotheses can be split
+ * from ONE flashed image. Remove once the P-hang is root-caused.
+ *
+ * force_all_idr: encode EVERY frame as an IDR/intra (equivalent to gop_size=1).
+ *   If P-frames only hang because they're INTER, all-IDR frames should all
+ *   succeed -> the hang is inter-prediction/reference specific. If a 2nd IDR
+ *   frame still hangs -> it's generic second-frame/session-state, not the
+ *   reference path.
+ * force_self_ref: make every P-frame read its OWN (fresh/empty) recon slot
+ *   instead of the previous frame's real FBC reconstruction -- mirroring the
+ *   I-frame's self-aliased reference. If the P then completes -> the stall is
+ *   specifically in CONSUMING real inter-reference FBC content, not the
+ *   inter-prediction machinery itself.
+ */
+static bool force_all_idr;
+module_param(force_all_idr, bool, 0644);
+MODULE_PARM_DESC(force_all_idr, "DIAG: encode every frame as IDR (gop_size=1 equivalent)");
+
+static bool force_self_ref;
+module_param(force_self_ref, bool, 0644);
+MODULE_PARM_DESC(force_self_ref, "DIAG: P-frames read their own empty recon slot, not the real reference");
 
 /* SPS log2_max_frame_num_minus4 / log2_max_pic_order_cnt_lsb_minus4: both
  * fixed at 4 (8-bit fields) so frame_num/poc_lsb wrap well past any sane
@@ -396,35 +421,6 @@ static int rkvenc_h264_start(struct rkvenc_ctx *ctx)
 	 * pointers (see the field comment in rkvenc.h). Sized like a full
 	 * recon buffer so even a full-frame-sized spurious write fits.
 	 */
-	h264->scratch_buf_size = total_size;
-	h264->scratch_buf_cpu = dma_alloc_coherent(dev->dev, h264->scratch_buf_size,
-						   &h264->scratch_buf_dma, GFP_KERNEL);
-	if (!h264->scratch_buf_cpu) {
-		dma_free_coherent(dev->dev, SZ_4K, h264->meiw_buf_cpu, h264->meiw_buf_dma);
-		for (i = 0; i < 2; i++)
-			dma_free_coherent(dev->dev, total_size,
-					  h264->recn_buf_cpu[i], h264->recn_buf_dma[i]);
-		return -ENOMEM;
-	}
-
-	/* Dedicated collocated-MV round-trip buffer (see the field comment in
-	 * rkvenc.h). One collocated MV per 16x16 macroblock; 64 bytes/MB is a
-	 * generous upper bound for any VEPU510 MV-storage layout, so this is
-	 * comfortably sized and zero-initialized by dma_alloc_coherent.
-	 */
-	h264->colmv_buf_size = ALIGN((size_t)(aligned_w / 16) * (aligned_h / 16) * 64, SZ_4K);
-	h264->colmv_buf_cpu = dma_alloc_coherent(dev->dev, h264->colmv_buf_size,
-						 &h264->colmv_buf_dma, GFP_KERNEL);
-	if (!h264->colmv_buf_cpu) {
-		dma_free_coherent(dev->dev, h264->scratch_buf_size,
-				  h264->scratch_buf_cpu, h264->scratch_buf_dma);
-		dma_free_coherent(dev->dev, SZ_4K, h264->meiw_buf_cpu, h264->meiw_buf_dma);
-		for (i = 0; i < 2; i++)
-			dma_free_coherent(dev->dev, total_size,
-					  h264->recn_buf_cpu[i], h264->recn_buf_dma[i]);
-		return -ENOMEM;
-	}
-
 	rkvenc_h264_gen_sps_pps(ctx);
 
 	return 0;
@@ -448,16 +444,6 @@ static void rkvenc_h264_stop(struct rkvenc_ctx *ctx)
 	if (h264->meiw_buf_cpu)
 		dma_free_coherent(dev->dev, SZ_4K, h264->meiw_buf_cpu, h264->meiw_buf_dma);
 	h264->meiw_buf_cpu = NULL;
-
-	if (h264->scratch_buf_cpu)
-		dma_free_coherent(dev->dev, h264->scratch_buf_size,
-				  h264->scratch_buf_cpu, h264->scratch_buf_dma);
-	h264->scratch_buf_cpu = NULL;
-
-	if (h264->colmv_buf_cpu)
-		dma_free_coherent(dev->dev, h264->colmv_buf_size,
-				  h264->colmv_buf_cpu, h264->colmv_buf_dma);
-	h264->colmv_buf_cpu = NULL;
 }
 
 /* VEPU510-only quirk sequence, written unconditionally on every task by
@@ -497,15 +483,17 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	unsigned int aligned_h = ALIGN(height, 16);
 	unsigned int uv_offset = ctx->src_fmt.bytesperline * ctx->src_fmt.height;
 	unsigned int dst_size = vb2_plane_size(&dst_buf->vb2_buf, 0);
-	bool is_idr = h264->gop_pos == 0;
+	bool is_idr = h264->gop_pos == 0 || force_all_idr; /* force_all_idr: DIAG */
 	unsigned int header_len = is_idr ? h264->sps_pps_len : 0;
 	unsigned int write_idx = h264->frame_num & 1;
 	/* Frame 0 has no previously-written reference at all -- alias read to
 	 * write (real hardware's refr_idx == curr_idx for frame 0, see the
 	 * rkvenc_h264_ctx comment in rkvenc.h). From frame 1 on, buf[write_idx
 	 * ^ 1] genuinely holds the previous frame's real reconstruction.
+	 * force_self_ref (DIAG) and forced-IDR frames also self-alias.
 	 */
-	unsigned int read_idx = h264->frame_num == 0 ? write_idx : (write_idx ^ 1);
+	unsigned int read_idx = (h264->frame_num == 0 || is_idr || force_self_ref) ?
+				write_idx : (write_idx ^ 1);
 	bool is_main = h264->profile->val == V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
 	bool cabac = h264->entropy_mode->val == V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC;
 	u32 qp = is_idr ? h264->i_qp->val : h264->p_qp->val;
@@ -531,81 +519,33 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 
 	rkvenc_write_relaxed(dev, RKVENC_REG_DBG_CLR, RKVENC_DBG_CLR_VAL);
 
-	/* Clear the ENTIRE FRAME class (0x270-0x3f4) before programming the
-	 * specific registers below. This is the fix for the isolated rk_iommu
-	 * WRITE fault seen since first bring-up (a wild write to a boot-varying
-	 * garbage IOVA with a stable 0x??b239?? signature -- the hallmark of a
-	 * stale/uninitialized pointer register).
+	/* Define every FRAME-class address/pointer register (0x270-0x2e8) by
+	 * zeroing it before the specific pointers below overwrite the ones this
+	 * driver actually uses. This matches the downstream vendor kernel, which
+	 * writes its ENTIRE register file linearly every frame so no register
+	 * ever carries stale bootloader/ATF/previous-session garbage. Doing this
+	 * moved the long-standing rk_iommu write fault from a boot-varying
+	 * garbage IOVA (the tell-tale 0x??b239?? stale-pointer signature) to a
+	 * benign, deterministic 0x0.
 	 *
-	 * Root cause, found by diffing a real multi-frame vendor wtrace capture:
-	 * the downstream vendor kernel writes its ENTIRE register file linearly
-	 * every frame, so every register -- including ~50 FRAME-class registers
-	 * this from-scratch driver never touches -- is always defined. Among the
-	 * ones this driver skipped are real hardware WRITE-pointer registers:
-	 * lpfw_addr(0x2c0, loop-filter write), lpfr_addr(0x2c4), ebuft/ebufb_addr
-	 * (0x2c8/0x2cc), adr_roir(0x2e8), and 0x29c/0x2a0. The vendor writes all
-	 * of them as 0; this driver left them at whatever the bootloader/ATF/a
-	 * previous session left behind. A garbage value in a write-pointer the
-	 * hardware still consults (the H.264 deblocking loop filter writes its
-	 * filtered output every frame) makes the engine DMA to that garbage
-	 * address -> the IOMMU write fault. Because the faulting write is a
-	 * reference/recon-path write (not the bitstream), the I-frame's bitstream
-	 * still completes, but the reconstruction it leaves for the next P-frame
-	 * is corrupt -- which is the most likely reason every P-frame then hangs
-	 * reading a bad reference (and why a larger resolution, whose stale
-	 * pointer lands somewhere more essential, fails even the I-frame).
-	 *
-	 * Board bring-up proved the previous "zero the whole block" version was
-	 * necessary but not sufficient: after zeroing, the fault simply moved
-	 * from a stale-garbage IOVA to 0x0 -- i.e. the hardware really does
-	 * issue a write through one of these pointers, and 0 is just as
-	 * unmapped as garbage. So instead of zeroing them, point every
-	 * FRAME-class pointer this driver doesn't otherwise use at a real
-	 * scratch DMA buffer, so any such write lands in valid memory. First
-	 * zero the whole block (defines every register, matching the vendor's
-	 * full-file write), then set the auxiliary write pointers to scratch;
-	 * the specific real pointers (src/rfpw/rfpr/dspw/dspr/meiw/bsb/smear)
-	 * are written with their real values further below and overwrite the
-	 * zeros. The syntax registers at 0x300+ this driver skips are
-	 * non-pointer and carry no wild-write risk.
+	 * That residual write@0 (BUG-2) is a HW-synthesized write through one of
+	 * these now-zero pointers (best candidate: the vrsp_rtn_en return-write
+	 * to the zero online_addr; the vendor sets the same ENC_ID quirk with
+	 * online_addr=0 and does NOT fault, so it is cosmetic). It is confirmed
+	 * INDEPENDENT of the P-frame hang and harmless to the I-frame: a
+	 * multi-agent evidence audit established the fault is a separate AXI
+	 * transaction from the real recon write (rfpw=valid), it never lands
+	 * (IOVA 0 pte invalid), and it cannot corrupt the reference the P-frame
+	 * reads. An earlier attempt to redirect these pointers to scratch DMA
+	 * buffers (colmvw/colmvr/lpfw/ebuft/ebufb) had NO measured effect on
+	 * either bug and diverged from the vendor (which keeps them 0), so it was
+	 * reverted -- zeroing alone is the vendor-matching behaviour.
 	 */
 	{
 		u32 off;
 
 		for (off = RKVENC_REG_FRAME_OFFSET; off <= RKVENC_REG_ADR_ROIR; off += 4)
 			rkvenc_write_relaxed(dev, off, 0);
-
-		/* Redirect the auxiliary pointers this driver leaves unused to
-		 * real DMA memory, leaving the rest at 0 (matching the vendor).
-		 *
-		 * THE culprit for the long-standing rk_iommu write fault is
-		 * colmvw_addr (0x29c) -- the collocated-motion-vector WRITE
-		 * pointer, where the hardware stores this frame's per-block MVs
-		 * (the temporal predictor). It's written every frame, ties
-		 * directly to the motion path, and was left at garbage/0 by this
-		 * driver -> wild write -> fault (board bring-up proved it: with
-		 * every OTHER aux pointer redirected but colmvw left at 0, the
-		 * write fault stayed, at 0x0). colmvw + colmvr share one dedicated
-		 * round-trip buffer so the read side can't fault or feed garbage
-		 * MVs into motion compensation either -- see the colmv_buf comment
-		 * in rkvenc.h.
-		 *
-		 * lpfw (0x2c0) and ext-line ebuft/ebufb (0x2c8/0x2cc) are the
-		 * other write-capable aux pointers -> pure write-discard scratch.
-		 *
-		 * NOT redirected (kept 0, exactly as the vendor): the online/DVBM
-		 * source pointers 0x270-0x27c and the read-only lpfr(0x2c4)/
-		 * roir(0x2e8). A broader attempt that gave the online pointers a
-		 * non-zero mapped value REGRESSED even the I-frame with an IOMMU
-		 * *read* fault -- a non-zero online pointer switches the encoder
-		 * onto a DVBM input path it isn't set up for. The real recon
-		 * reference (rfpw) is untouched throughout.
-		 */
-		rkvenc_write_relaxed(dev, RKVENC_REG_COLMVW_ADDR, h264->colmv_buf_dma);
-		rkvenc_write_relaxed(dev, RKVENC_REG_COLMVR_ADDR, h264->colmv_buf_dma);
-		rkvenc_write_relaxed(dev, RKVENC_REG_LPFW_ADDR, h264->scratch_buf_dma);
-		rkvenc_write_relaxed(dev, RKVENC_REG_EBUFT_ADDR, h264->scratch_buf_dma);
-		rkvenc_write_relaxed(dev, RKVENC_REG_EBUFB_ADDR, h264->scratch_buf_dma);
 	}
 
 	/* TEMPORARY diagnostic for the isolated rk_iommu write-fault seen on
@@ -1152,11 +1092,27 @@ static void rkvenc_h264_done(struct rkvenc_ctx *ctx, enum vb2_buffer_state state
 	struct rkvenc_dev *dev = ctx->dev;
 	struct rkvenc_h264_ctx *h264 = &ctx->h264;
 	struct vb2_v4l2_buffer *dst_buf = rkvenc_get_dst_buf(ctx);
-	bool is_idr = h264->gop_pos == 0;
+	bool is_idr = h264->gop_pos == 0 || force_all_idr;
 
 	if (state == VB2_BUF_STATE_DONE) {
 		unsigned int header_len = is_idr ? h264->sps_pps_len : 0;
 		u32 hw_len = rkvenc_read(dev, RKVENC_REG_ST_BS_LENGTH);
+		/* TEMPORARY diagnostic (see BRINGUP.md): dump the first words of
+		 * the FBC reconstruction header this frame just wrote. recn_buf is
+		 * dma_alloc_coherent so the CPU pointer is live and coherent (no
+		 * cache op needed). On the I-frame's completion this decides the
+		 * P-hang WRITE-vs-READ split: an all-zero header means the recon
+		 * *write* never landed (a bad WRITE); a populated header means the
+		 * reference is valid and the P-frame hangs consuming a *good*
+		 * reference (a bad READ / FBC-decode).
+		 */
+		unsigned int wr = h264->frame_num & 1;
+		const u32 *hdr = h264->recn_buf_cpu[wr];
+
+		dev_info(dev->dev,
+			 "done: recon[w=%u] hw_len=%u fbc_hdr=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+			 wr, hw_len, hdr[0], hdr[1], hdr[2], hdr[3],
+			 hdr[4], hdr[5], hdr[6], hdr[7]);
 
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, header_len + hw_len);
 		dst_buf->flags |= is_idr ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;

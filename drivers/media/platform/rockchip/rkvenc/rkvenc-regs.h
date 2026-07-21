@@ -67,7 +67,10 @@
  */
 #define RKVENC_REG_VERSION		0x0000	/* read-only IP identification */
 #define RKVENC_REG_ENC_START		0x0010	/* enc_strt */
-#define RKVENC_REG_ENC_CLR		0x0014
+#define RKVENC_REG_ENC_CLR		0x0014	/* bit0 safe_clr, bit1 force_clr */
+#define RKVENC_ENC_CLR_SAFE		0x1
+#define RKVENC_ENC_CLR_FORCE		0x2
+#define RKVENC_SCLR_DONE_STA		BIT(2)	/* int_sta sclr_done, set when safe-clr completes */
 #define RKVENC_REG_VS_LDLY		0x0018
 
 union rkvenc_reg_version {
