@@ -520,6 +520,8 @@ union rkvenc_reg_synt_sli2 {
  * handling and big comment in rkvenc_h264_run()): loop-filter write/read
  * and the ext-line top/bottom buffers.
  */
+#define RKVENC_REG_COLMVW_ADDR		0x29c	/* collocated-MV write (temporal predictor store) */
+#define RKVENC_REG_COLMVR_ADDR		0x2a0	/* collocated-MV read */
 #define RKVENC_REG_LPFW_ADDR		0x2c0
 #define RKVENC_REG_LPFR_ADDR		0x2c4
 #define RKVENC_REG_EBUFT_ADDR		0x2c8

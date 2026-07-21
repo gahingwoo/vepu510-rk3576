@@ -172,6 +172,21 @@ struct rkvenc_h264_ctx {
 	void *scratch_buf_cpu;
 	dma_addr_t scratch_buf_dma;
 	size_t scratch_buf_size;
+
+	/* Collocated-motion-vector buffer (colmvw_addr 0x29c write / colmvr_addr
+	 * 0x2a0 read). Unlike the pure write-discard scratch above, this one is
+	 * a REAL round-trip: the hardware stores this frame's per-block motion
+	 * vectors here (colmvw) for the next frame to read back as temporal
+	 * predictors (colmvr), so it gets its own dedicated, zero-initialized
+	 * buffer that both pointers share -- frame N reads frame N-1's MVs then
+	 * overwrites with its own, which is exactly correct temporal-predictor
+	 * behaviour. Board bring-up proved colmvw is THE source of the
+	 * long-standing rk_iommu write fault: left at garbage/0, the hardware
+	 * DMAs this frame's MVs to a wild address every frame.
+	 */
+	void *colmv_buf_cpu;
+	dma_addr_t colmv_buf_dma;
+	size_t colmv_buf_size;
 };
 
 struct rkvenc_ctx {

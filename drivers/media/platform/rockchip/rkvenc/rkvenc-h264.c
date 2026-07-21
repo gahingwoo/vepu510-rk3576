@@ -407,6 +407,24 @@ static int rkvenc_h264_start(struct rkvenc_ctx *ctx)
 		return -ENOMEM;
 	}
 
+	/* Dedicated collocated-MV round-trip buffer (see the field comment in
+	 * rkvenc.h). One collocated MV per 16x16 macroblock; 64 bytes/MB is a
+	 * generous upper bound for any VEPU510 MV-storage layout, so this is
+	 * comfortably sized and zero-initialized by dma_alloc_coherent.
+	 */
+	h264->colmv_buf_size = ALIGN((size_t)(aligned_w / 16) * (aligned_h / 16) * 64, SZ_4K);
+	h264->colmv_buf_cpu = dma_alloc_coherent(dev->dev, h264->colmv_buf_size,
+						 &h264->colmv_buf_dma, GFP_KERNEL);
+	if (!h264->colmv_buf_cpu) {
+		dma_free_coherent(dev->dev, h264->scratch_buf_size,
+				  h264->scratch_buf_cpu, h264->scratch_buf_dma);
+		dma_free_coherent(dev->dev, SZ_4K, h264->meiw_buf_cpu, h264->meiw_buf_dma);
+		for (i = 0; i < 2; i++)
+			dma_free_coherent(dev->dev, total_size,
+					  h264->recn_buf_cpu[i], h264->recn_buf_dma[i]);
+		return -ENOMEM;
+	}
+
 	rkvenc_h264_gen_sps_pps(ctx);
 
 	return 0;
@@ -435,6 +453,11 @@ static void rkvenc_h264_stop(struct rkvenc_ctx *ctx)
 		dma_free_coherent(dev->dev, h264->scratch_buf_size,
 				  h264->scratch_buf_cpu, h264->scratch_buf_dma);
 	h264->scratch_buf_cpu = NULL;
+
+	if (h264->colmv_buf_cpu)
+		dma_free_coherent(dev->dev, h264->colmv_buf_size,
+				  h264->colmv_buf_cpu, h264->colmv_buf_dma);
+	h264->colmv_buf_cpu = NULL;
 }
 
 /* VEPU510-only quirk sequence, written unconditionally on every task by
@@ -552,21 +575,34 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		for (off = RKVENC_REG_FRAME_OFFSET; off <= RKVENC_REG_ADR_ROIR; off += 4)
 			rkvenc_write_relaxed(dev, off, 0);
 
-		/* Redirect ONLY the auxiliary WRITE pointers to scratch, leaving
-		 * everything else at 0 (matching the vendor). A first, broader
-		 * attempt that also pointed the "online"/DVBM source pointers
-		 * (0x270-0x27c) and the read-side pointers (lpfr 0x2c4, roir
-		 * 0x2e8) at a valid buffer REGRESSED even the I-frame with an
-		 * IOMMU *read* fault at a tiny offset -- giving those pointers a
-		 * non-zero (mapped) value evidently switches the encoder onto an
-		 * online/DVBM input path it isn't set up for, so it tries to read
-		 * input descriptors from the wrong place. So keep those at 0
-		 * (feature off, exactly as the vendor does) and redirect only the
-		 * loop-filter write (lpfw 0x2c0) and the ext-line write buffers
-		 * (ebuft/ebufb 0x2c8/0x2cc) -- the write engines that actually
-		 * fault -- so their writes land in valid memory instead of a
-		 * garbage/NULL IOVA. The real recon reference (rfpw) is untouched.
+		/* Redirect the auxiliary pointers this driver leaves unused to
+		 * real DMA memory, leaving the rest at 0 (matching the vendor).
+		 *
+		 * THE culprit for the long-standing rk_iommu write fault is
+		 * colmvw_addr (0x29c) -- the collocated-motion-vector WRITE
+		 * pointer, where the hardware stores this frame's per-block MVs
+		 * (the temporal predictor). It's written every frame, ties
+		 * directly to the motion path, and was left at garbage/0 by this
+		 * driver -> wild write -> fault (board bring-up proved it: with
+		 * every OTHER aux pointer redirected but colmvw left at 0, the
+		 * write fault stayed, at 0x0). colmvw + colmvr share one dedicated
+		 * round-trip buffer so the read side can't fault or feed garbage
+		 * MVs into motion compensation either -- see the colmv_buf comment
+		 * in rkvenc.h.
+		 *
+		 * lpfw (0x2c0) and ext-line ebuft/ebufb (0x2c8/0x2cc) are the
+		 * other write-capable aux pointers -> pure write-discard scratch.
+		 *
+		 * NOT redirected (kept 0, exactly as the vendor): the online/DVBM
+		 * source pointers 0x270-0x27c and the read-only lpfr(0x2c4)/
+		 * roir(0x2e8). A broader attempt that gave the online pointers a
+		 * non-zero mapped value REGRESSED even the I-frame with an IOMMU
+		 * *read* fault -- a non-zero online pointer switches the encoder
+		 * onto a DVBM input path it isn't set up for. The real recon
+		 * reference (rfpw) is untouched throughout.
 		 */
+		rkvenc_write_relaxed(dev, RKVENC_REG_COLMVW_ADDR, h264->colmv_buf_dma);
+		rkvenc_write_relaxed(dev, RKVENC_REG_COLMVR_ADDR, h264->colmv_buf_dma);
 		rkvenc_write_relaxed(dev, RKVENC_REG_LPFW_ADDR, h264->scratch_buf_dma);
 		rkvenc_write_relaxed(dev, RKVENC_REG_EBUFT_ADDR, h264->scratch_buf_dma);
 		rkvenc_write_relaxed(dev, RKVENC_REG_EBUFB_ADDR, h264->scratch_buf_dma);
