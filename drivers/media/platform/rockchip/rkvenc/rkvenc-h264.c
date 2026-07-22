@@ -70,6 +70,22 @@ static unsigned int pre_kick_delay_us;
 module_param(pre_kick_delay_us, uint, 0644);
 MODULE_PARM_DESC(pre_kick_delay_us, "DIAG: udelay(N) before ENC_START to let the reference settle");
 
+/* force_no_fbc: store the reconstruction UNCOMPRESSED (enc_pic.rec_fbc_dis=1)
+ * instead of FBC-compressed, so the P-frame reads a plain uncompressed
+ * reference and the FBC-decode path is bypassed entirely. The confirmed
+ * P-hang is on reading the prior frame's FBC reconstruction; if uncompressed
+ * recon makes P-frames complete, FBC-decode is the culprit. Requires the
+ * vendor's clock-disable dance around the ENC_PIC BIT(31) write (writing
+ * BIT(31) with the core clock live "may cause the DMA module to falsely
+ * trigger writing data -> enc err", per mpp_rkvenc2.c) and rfpw_b==rfpw_h /
+ * rfpr_b==rfpr_h (no FBC-header offset). The recon buffer is already sized
+ * for FBC (pixel hdr+body) which exceeds the uncompressed pixel size, so no
+ * reallocation is needed for the test.
+ */
+static bool force_no_fbc;
+module_param(force_no_fbc, bool, 0644);
+MODULE_PARM_DESC(force_no_fbc, "DIAG: store reconstruction uncompressed (rec_fbc_dis=1), bypassing FBC decode");
+
 /* SPS log2_max_frame_num_minus4 / log2_max_pic_order_cnt_lsb_minus4: both
  * fixed at 4 (8-bit fields) so frame_num/poc_lsb wrap well past any sane
  * GOP size while still fitting the 4-bit synt_sps.max_fnum/mpoc_lm4
@@ -592,24 +608,33 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	 * tight retry loop instead of failing cleanly. The read side
 	 * (rfpr/dspr/smear_rd) aliases the write side on frame 0 via
 	 * read_idx == write_idx, see the read_idx comment above.
+	 *
+	 * force_no_fbc (DIAG): with rec_fbc_dis=1 the reconstruction is stored
+	 * uncompressed, so rfpw_b/rfpr_b carry NO FBC-header offset (the
+	 * vendor's pass1 path sets rfpw_b == rfpw_h). Otherwise the FBC body
+	 * sits at +pixel_hdr_size after the header.
 	 */
-	rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_H_ADDR, h264->recn_buf_dma[write_idx]);
-	rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_B_ADDR,
-			     h264->recn_buf_dma[write_idx] + h264->pixel_hdr_size);
-	rkvenc_write_relaxed(dev, RKVENC_REG_DSPW_ADDR,
-			     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size);
-	rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_WR,
-			     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size +
-			     h264->thumb_buf_size);
+	{
+		size_t hdr_off = force_no_fbc ? 0 : h264->pixel_hdr_size;
 
-	rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_H_ADDR, h264->recn_buf_dma[read_idx]);
-	rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_B_ADDR,
-			     h264->recn_buf_dma[read_idx] + h264->pixel_hdr_size);
-	rkvenc_write_relaxed(dev, RKVENC_REG_DSPR_ADDR,
-			     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size);
-	rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_RD,
-			     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size +
-			     h264->thumb_buf_size);
+		rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_H_ADDR, h264->recn_buf_dma[write_idx]);
+		rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_B_ADDR,
+				     h264->recn_buf_dma[write_idx] + hdr_off);
+		rkvenc_write_relaxed(dev, RKVENC_REG_DSPW_ADDR,
+				     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size);
+		rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_WR,
+				     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size +
+				     h264->thumb_buf_size);
+
+		rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_H_ADDR, h264->recn_buf_dma[read_idx]);
+		rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_B_ADDR,
+				     h264->recn_buf_dma[read_idx] + hdr_off);
+		rkvenc_write_relaxed(dev, RKVENC_REG_DSPR_ADDR,
+				     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size);
+		rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_RD,
+				     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size +
+				     h264->thumb_buf_size);
+	}
 
 	rkvenc_write_relaxed(dev, RKVENC_REG_MEIW_ADDR, h264->meiw_buf_dma);
 
@@ -990,7 +1015,7 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	enc_pic.enc_stnd = RKVENC_ENC_STND_H264;
 	enc_pic.cur_frm_ref = 1;
 	enc_pic.pic_qp = qp;
-	enc_pic.rec_fbc_dis = 0;
+	enc_pic.rec_fbc_dis = force_no_fbc ? 1 : 0; /* DIAG: uncompressed recon */
 	/* mpp's setup_vepu510_codec() sets this unconditionally to 1 on every
 	 * frame; confirmed not just from source but from the real vendor
 	 * wtrace capture used for the original I-frame bring-up (0x300 was
@@ -1090,9 +1115,22 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		/* Final ENC_PIC re-write with slen_fifo=1 -- arms the slice-length
 		 * FIFO as the very last action before ENC_START, matching the
 		 * capture exactly. This is the whole point of the two-step arm.
+		 *
+		 * force_no_fbc (DIAG): with rec_fbc_dis=1 (ENC_PIC bit31) set, the
+		 * vendor gates this exact write behind a core-clock disable --
+		 * "Writing reg 0x300 BIT(31) may cause the DMA module to falsely
+		 * trigger writing data -> enc err" (mpp_rkvenc2.c). Reproduce that
+		 * dance so the uncompressed-recon test doesn't itself trigger the
+		 * spurious-DMA enc_err.
 		 */
 		enc_pic.slen_fifo = 1;
-		rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
+		if (force_no_fbc && dev->core_clk) {
+			clk_disable(dev->core_clk);
+			rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
+			clk_enable(dev->core_clk);
+		} else {
+			rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
+		}
 
 		wmb(); /* all task registers visible before the kick below */
 

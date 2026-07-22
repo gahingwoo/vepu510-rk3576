@@ -65,6 +65,7 @@ struct rkvenc_dev {
 	void __iomem *regs;
 	struct clk_bulk_data *clocks;
 	int num_clocks;
+	struct clk *core_clk;	/* the "clk_core" entry within clocks[] */
 	struct reset_control *rst;
 
 	/* Protects ctx list / hardware access ordering. vb2 queues already

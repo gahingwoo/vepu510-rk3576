@@ -789,8 +789,10 @@ static int rkvenc_probe(struct platform_device *pdev)
 
 	for (i = 0; i < rkvenc->num_clocks; i++) {
 		clk = &rkvenc->clocks[i];
-		if (!strcmp(clk->id, "clk_core"))
+		if (!strcmp(clk->id, "clk_core")) {
 			rkvenc->core_clk_rate = clk_get_rate(clk->clk);
+			rkvenc->core_clk = clk->clk;
+		}
 	}
 	if (!rkvenc->core_clk_rate)
 		rkvenc->core_clk_rate = 702000000;
