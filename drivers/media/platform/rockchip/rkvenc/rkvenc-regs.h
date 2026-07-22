@@ -216,19 +216,12 @@ union rkvenc_reg_enc_pic {
  * (DCHS_REG_OFFSET in the downstream vendor kernel's mpp_rkvenc2.c) --
  * used for chaining a frame's encode across both VEPU510 cores. This
  * driver deliberately doesn't implement that (see the architecture
- * comment in rkvenc.c), but the register still needs to be explicitly
- * disabled (dchs_txe=dchs_rxe=0) every frame: the vendor kernel's own
- * rkvenc2_patch_dchs() writes a real, non-zero value here on EVERY task
- * (even fully standalone, non-chained ones -- confirmed via a real wtrace
- * capture: 0x304=0x14, i.e. dchs_txe=1, on a plain single-core encode),
- * so POR-reset/leftover 0 is not necessarily what the hardware is
- * actually in when this driver's probe() first runs. Previously left
- * entirely unwritten by this driver (the register was *defined* in this
- * header but never actually used) -- a real gap, found while chasing an
- * isolated rk_iommu write fault at an IOVA far outside any of this
- * driver's own real buffer addresses (see BRINGUP.md), consistent with an
- * unconfigured cross-core handshake mechanism reading/writing through a
- * garbage address instead of quietly doing nothing.
+ * comment in rkvenc.c), but the register is still written explicitly every
+ * frame to a defined value (dchs_txe=1, i.e. 0x14): the vendor kernel's
+ * own rkvenc2_patch_dchs() writes exactly this on every task, even fully
+ * standalone non-chained ones (confirmed against a real register-write
+ * trace of the vendor stack), so a POR/leftover value is not what the
+ * hardware expects.
  */
 union rkvenc_reg_dual_core {
 	struct {
@@ -518,17 +511,6 @@ union rkvenc_reg_synt_sli2 {
 #define RKVENC_REG_BSBB_ADDR		0x2b4
 #define RKVENC_REG_ADR_BSBS		0x2b8
 #define RKVENC_REG_BSBR_ADDR		0x2bc
-/* Auxiliary write/read pointers this driver doesn't use for real data but
- * which the hardware still issues writes through (see the scratch-buffer
- * handling and big comment in rkvenc_h264_run()): loop-filter write/read
- * and the ext-line top/bottom buffers.
- */
-#define RKVENC_REG_COLMVW_ADDR		0x29c	/* collocated-MV write (temporal predictor store) */
-#define RKVENC_REG_COLMVR_ADDR		0x2a0	/* collocated-MV read */
-#define RKVENC_REG_LPFW_ADDR		0x2c0
-#define RKVENC_REG_LPFR_ADDR		0x2c4
-#define RKVENC_REG_EBUFT_ADDR		0x2c8
-#define RKVENC_REG_EBUFB_ADDR		0x2cc
 /* rfpt/rfpb ("top"/"bottom" field recon addresses, interlaced-only):
  * real capture always carries the literal sentinel 0xffffffff in
  * rfpt_h/rfpt_b (not an fd-embedded pointer -- an fd of 0x3ff/1023 is
@@ -943,17 +925,5 @@ union rkvenc_reg_smear_opt_cfg {
 /* ---- DEBUG class ---- */
 #define RKVENC_REG_DBG_CLR		0x5300
 #define RKVENC_DBG_CLR_VAL		0x2
-
-/* Downstream vendor kernel's own genuine-hardware-timeout diagnostic range
- * (rkvenc2_task_timeout_process()'s RKVENC2_TIMEOUT_DUMP_REG_START/END in
- * mpp_rkvenc2.c) -- dumped via a generic offset+value reg_show(), no field
- * names anywhere (same "opaque DEBUG class" situation as the rest of this
- * class). If the vendor's own driver considers this specific 0x5100-0x515c
- * range worth reading back on a real timeout, it's the most likely place to
- * see *something* distinguishing the internal engine state at the moment a
- * P-frame hangs vs a working I-frame, even with no field semantics known.
- */
-#define RKVENC_REG_DEBUG_TIMEOUT_DUMP_START	0x5100
-#define RKVENC_REG_DEBUG_TIMEOUT_DUMP_END	0x5160	/* exclusive */
 
 #endif /* RKVENC_REGS_H_ */

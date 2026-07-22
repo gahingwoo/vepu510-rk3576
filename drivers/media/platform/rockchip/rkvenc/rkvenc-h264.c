@@ -22,69 +22,13 @@
 
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/iommu.h>
 #include <linux/log2.h>
-#include <linux/moduleparam.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "rkvenc.h"
 #include "rkvenc-regs.h"
-
-/* TEMPORARY diagnostics for the P-frame hardware-watchdog investigation (see
- * BRINGUP.md). Toggleable at runtime via
- * /sys/module/rockchip_vepu510/parameters/ so several hypotheses can be split
- * from ONE flashed image. Remove once the P-hang is root-caused.
- *
- * force_all_idr: encode EVERY frame as an IDR/intra (equivalent to gop_size=1).
- *   If P-frames only hang because they're INTER, all-IDR frames should all
- *   succeed -> the hang is inter-prediction/reference specific. If a 2nd IDR
- *   frame still hangs -> it's generic second-frame/session-state, not the
- *   reference path.
- * force_self_ref: make every P-frame read its OWN (fresh/empty) recon slot
- *   instead of the previous frame's real FBC reconstruction -- mirroring the
- *   I-frame's self-aliased reference. If the P then completes -> the stall is
- *   specifically in CONSUMING real inter-reference FBC content, not the
- *   inter-prediction machinery itself.
- */
-static bool force_all_idr;
-module_param(force_all_idr, bool, 0644);
-MODULE_PARM_DESC(force_all_idr, "DIAG: encode every frame as IDR (gop_size=1 equivalent)");
-
-static bool force_self_ref;
-module_param(force_self_ref, bool, 0644);
-MODULE_PARM_DESC(force_self_ref, "DIAG: P-frames read their own empty recon slot, not the real reference");
-
-/* pre_kick_iommu_flush / pre_kick_delay_us: candidate barriers for the
- * confirmed inter-frame FBC-reconstruction write-to-read hazard (the prior
- * frame's recon isn't settled when the next frame reads it). If either makes
- * the real-reference P-frames complete, the fix is a proper pre-kick
- * drain/barrier. See rkvenc_h264_run().
- */
-static bool pre_kick_iommu_flush;
-module_param(pre_kick_iommu_flush, bool, 0644);
-MODULE_PARM_DESC(pre_kick_iommu_flush, "DIAG: iommu_flush_iotlb_all before ENC_START");
-
-static unsigned int pre_kick_delay_us;
-module_param(pre_kick_delay_us, uint, 0644);
-MODULE_PARM_DESC(pre_kick_delay_us, "DIAG: udelay(N) before ENC_START to let the reference settle");
-
-/* force_no_fbc: store the reconstruction UNCOMPRESSED (enc_pic.rec_fbc_dis=1)
- * instead of FBC-compressed, so the P-frame reads a plain uncompressed
- * reference and the FBC-decode path is bypassed entirely. The confirmed
- * P-hang is on reading the prior frame's FBC reconstruction; if uncompressed
- * recon makes P-frames complete, FBC-decode is the culprit. Requires the
- * vendor's clock-disable dance around the ENC_PIC BIT(31) write (writing
- * BIT(31) with the core clock live "may cause the DMA module to falsely
- * trigger writing data -> enc err", per mpp_rkvenc2.c) and rfpw_b==rfpw_h /
- * rfpr_b==rfpr_h (no FBC-header offset). The recon buffer is already sized
- * for FBC (pixel hdr+body) which exceeds the uncompressed pixel size, so no
- * reallocation is needed for the test.
- */
-static bool force_no_fbc;
-module_param(force_no_fbc, bool, 0644);
-MODULE_PARM_DESC(force_no_fbc, "DIAG: store reconstruction uncompressed (rec_fbc_dis=1), bypassing FBC decode");
 
 /* SPS log2_max_frame_num_minus4 / log2_max_pic_order_cnt_lsb_minus4: both
  * fixed at 4 (8-bit fields) so frame_num/poc_lsb wrap well past any sane
@@ -514,17 +458,15 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	unsigned int aligned_h = ALIGN(height, 16);
 	unsigned int uv_offset = ctx->src_fmt.bytesperline * ctx->src_fmt.height;
 	unsigned int dst_size = vb2_plane_size(&dst_buf->vb2_buf, 0);
-	bool is_idr = h264->gop_pos == 0 || force_all_idr; /* force_all_idr: DIAG */
+	bool is_idr = h264->gop_pos == 0;
 	unsigned int header_len = is_idr ? h264->sps_pps_len : 0;
 	unsigned int write_idx = h264->frame_num & 1;
 	/* Frame 0 has no previously-written reference at all -- alias read to
 	 * write (real hardware's refr_idx == curr_idx for frame 0, see the
 	 * rkvenc_h264_ctx comment in rkvenc.h). From frame 1 on, buf[write_idx
 	 * ^ 1] genuinely holds the previous frame's real reconstruction.
-	 * force_self_ref (DIAG) and forced-IDR frames also self-alias.
 	 */
-	unsigned int read_idx = (h264->frame_num == 0 || is_idr || force_self_ref) ?
-				write_idx : (write_idx ^ 1);
+	unsigned int read_idx = h264->frame_num == 0 ? write_idx : (write_idx ^ 1);
 	bool is_main = h264->profile->val == V4L2_MPEG_VIDEO_H264_PROFILE_MAIN;
 	bool cabac = h264->entropy_mode->val == V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC;
 	u32 qp = is_idr ? h264->i_qp->val : h264->p_qp->val;
@@ -579,19 +521,6 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 			rkvenc_write_relaxed(dev, off, 0);
 	}
 
-	/* TEMPORARY diagnostic for the isolated rk_iommu write-fault seen on
-	 * first board bring-up (see BRINGUP.md "known gaps") -- dump every
-	 * real DMA address this frame uses so the fault IOVA can be
-	 * correlated against one of them (or ruled out as none of them,
-	 * pointing elsewhere). Remove once root-caused.
-	 */
-	dev_info(dev->dev,
-		 "run: src=%pad(+%u) dst=%pad(+%u,sz=%u) recn[w=%u]=%pad(+hdr%zu,+pix%zu) recn[r=%u]=%pad meiw=%pad\n",
-		 &src_dma, uv_offset, &dst_dma, header_len, dst_size,
-		 write_idx, &h264->recn_buf_dma[write_idx], h264->pixel_hdr_size,
-		 h264->pixel_buf_size, read_idx, &h264->recn_buf_dma[read_idx],
-		 &h264->meiw_buf_dma);
-
 	/* Source frame (NV12): adr_src0 = Y, adr_src1 = UV. adr_src2 (a 3rd
 	 * plane pointer NV12 doesn't have) must equal adr_src1, not 0 — mpp's
 	 * hal_h264e_vepu510.c sets it unconditionally to the same fd as
@@ -608,33 +537,24 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	 * tight retry loop instead of failing cleanly. The read side
 	 * (rfpr/dspr/smear_rd) aliases the write side on frame 0 via
 	 * read_idx == write_idx, see the read_idx comment above.
-	 *
-	 * force_no_fbc (DIAG): with rec_fbc_dis=1 the reconstruction is stored
-	 * uncompressed, so rfpw_b/rfpr_b carry NO FBC-header offset (the
-	 * vendor's pass1 path sets rfpw_b == rfpw_h). Otherwise the FBC body
-	 * sits at +pixel_hdr_size after the header.
 	 */
-	{
-		size_t hdr_off = force_no_fbc ? 0 : h264->pixel_hdr_size;
+	rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_H_ADDR, h264->recn_buf_dma[write_idx]);
+	rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_B_ADDR,
+			     h264->recn_buf_dma[write_idx] + h264->pixel_hdr_size);
+	rkvenc_write_relaxed(dev, RKVENC_REG_DSPW_ADDR,
+			     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size);
+	rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_WR,
+			     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size +
+			     h264->thumb_buf_size);
 
-		rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_H_ADDR, h264->recn_buf_dma[write_idx]);
-		rkvenc_write_relaxed(dev, RKVENC_REG_RFPW_B_ADDR,
-				     h264->recn_buf_dma[write_idx] + hdr_off);
-		rkvenc_write_relaxed(dev, RKVENC_REG_DSPW_ADDR,
-				     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size);
-		rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_WR,
-				     h264->recn_buf_dma[write_idx] + h264->pixel_buf_size +
-				     h264->thumb_buf_size);
-
-		rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_H_ADDR, h264->recn_buf_dma[read_idx]);
-		rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_B_ADDR,
-				     h264->recn_buf_dma[read_idx] + hdr_off);
-		rkvenc_write_relaxed(dev, RKVENC_REG_DSPR_ADDR,
-				     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size);
-		rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_RD,
-				     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size +
-				     h264->thumb_buf_size);
-	}
+	rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_H_ADDR, h264->recn_buf_dma[read_idx]);
+	rkvenc_write_relaxed(dev, RKVENC_REG_RFPR_B_ADDR,
+			     h264->recn_buf_dma[read_idx] + h264->pixel_hdr_size);
+	rkvenc_write_relaxed(dev, RKVENC_REG_DSPR_ADDR,
+			     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size);
+	rkvenc_write_relaxed(dev, RKVENC_REG_ADR_SMEAR_RD,
+			     h264->recn_buf_dma[read_idx] + h264->pixel_buf_size +
+			     h264->thumb_buf_size);
 
 	rkvenc_write_relaxed(dev, RKVENC_REG_MEIW_ADDR, h264->meiw_buf_dma);
 
@@ -1015,7 +935,7 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 	enc_pic.enc_stnd = RKVENC_ENC_STND_H264;
 	enc_pic.cur_frm_ref = 1;
 	enc_pic.pic_qp = qp;
-	enc_pic.rec_fbc_dis = force_no_fbc ? 1 : 0; /* DIAG: uncompressed recon */
+	enc_pic.rec_fbc_dis = 0;
 	/* mpp's setup_vepu510_codec() sets this unconditionally to 1 on every
 	 * frame; confirmed not just from source but from the real vendor
 	 * wtrace capture used for the original I-frame bring-up (0x300 was
@@ -1115,46 +1035,11 @@ static void rkvenc_h264_run(struct rkvenc_ctx *ctx)
 		/* Final ENC_PIC re-write with slen_fifo=1 -- arms the slice-length
 		 * FIFO as the very last action before ENC_START, matching the
 		 * capture exactly. This is the whole point of the two-step arm.
-		 *
-		 * force_no_fbc (DIAG): with rec_fbc_dis=1 (ENC_PIC bit31) set, the
-		 * vendor gates this exact write behind a core-clock disable --
-		 * "Writing reg 0x300 BIT(31) may cause the DMA module to falsely
-		 * trigger writing data -> enc err" (mpp_rkvenc2.c). Reproduce that
-		 * dance so the uncompressed-recon test doesn't itself trigger the
-		 * spurious-DMA enc_err.
 		 */
 		enc_pic.slen_fifo = 1;
-		if (force_no_fbc && dev->core_clk) {
-			clk_disable(dev->core_clk);
-			rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
-			clk_enable(dev->core_clk);
-		} else {
-			rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
-		}
+		rkvenc_write_relaxed(dev, RKVENC_REG_ENC_PIC, enc_pic.val);
 
 		wmb(); /* all task registers visible before the kick below */
-
-		/* TEMPORARY diagnostics (see BRINGUP.md): the P-frame hang was
-		 * localized to an inter-frame write-to-read hazard -- the prior
-		 * frame's FBC reconstruction isn't fully settled/visible when this
-		 * frame's ME reads it as the reference (reading a self/settled slot
-		 * completes; reading the immediately-prior fresh recon hangs; a
-		 * reset/warmup makes it work). Test the two candidate barriers:
-		 *   pre_kick_iommu_flush -- the vendor's per-submit IOMMU flush this
-		 *     driver omits; also an ordering/visibility barrier.
-		 *   pre_kick_delay_us -- a crude settle delay; if this alone fixes
-		 *     the P-hang, the real fix is a proper drain/barrier, not a
-		 *     delay. Only P-frames read a real reference, so this only needs
-		 *     to matter there, but apply unconditionally for a clean test.
-		 */
-		if (pre_kick_iommu_flush) {
-			struct iommu_domain *dom = iommu_get_domain_for_dev(dev->dev);
-
-			if (dom)
-				iommu_flush_iotlb_all(dom);
-		}
-		if (pre_kick_delay_us)
-			udelay(pre_kick_delay_us);
 
 		enc_strt.lkt_num = 0;
 		enc_strt.vepu_cmd = RKVENC_VEPU_CMD_ENC;
@@ -1167,27 +1052,11 @@ static void rkvenc_h264_done(struct rkvenc_ctx *ctx, enum vb2_buffer_state state
 	struct rkvenc_dev *dev = ctx->dev;
 	struct rkvenc_h264_ctx *h264 = &ctx->h264;
 	struct vb2_v4l2_buffer *dst_buf = rkvenc_get_dst_buf(ctx);
-	bool is_idr = h264->gop_pos == 0 || force_all_idr;
+	bool is_idr = h264->gop_pos == 0;
 
 	if (state == VB2_BUF_STATE_DONE) {
 		unsigned int header_len = is_idr ? h264->sps_pps_len : 0;
 		u32 hw_len = rkvenc_read(dev, RKVENC_REG_ST_BS_LENGTH);
-		/* TEMPORARY diagnostic (see BRINGUP.md): dump the first words of
-		 * the FBC reconstruction header this frame just wrote. recn_buf is
-		 * dma_alloc_coherent so the CPU pointer is live and coherent (no
-		 * cache op needed). On the I-frame's completion this decides the
-		 * P-hang WRITE-vs-READ split: an all-zero header means the recon
-		 * *write* never landed (a bad WRITE); a populated header means the
-		 * reference is valid and the P-frame hangs consuming a *good*
-		 * reference (a bad READ / FBC-decode).
-		 */
-		unsigned int wr = h264->frame_num & 1;
-		const u32 *hdr = h264->recn_buf_cpu[wr];
-
-		dev_info(dev->dev,
-			 "done: recon[w=%u] hw_len=%u fbc_hdr=%08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 wr, hw_len, hdr[0], hdr[1], hdr[2], hdr[3],
-			 hdr[4], hdr[5], hdr[6], hdr[7]);
 
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, header_len + hw_len);
 		dst_buf->flags |= is_idr ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
